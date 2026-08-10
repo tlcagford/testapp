@@ -72,10 +72,39 @@ def _build_wheel_luts(wheel_px, n):
 
 _WHEEL_U, _WHEEL_V, _WHEEL_HUE, _WHEEL_MASK = _build_wheel_luts(WHEEL_PX, N)
 
-def compute_psd_wheel(gray_full, mode, hue_shift):
+def apply_dynamic_range_remap(field01, clahe_clip, blend, gamma):
+    """
+    Real dynamic-range remap: adaptive histogram equalization (CLAHE) blended
+    with the raw field, then a gamma curve. gamma < 1 lifts faint values
+    (the "invisible" — near-zero power) toward mid/high brightness while
+    compressing the differences between already-strong values (the
+    "visible" — near-max power), so dominant content stops overwhelming the
+    display and faint content stops disappearing into it. This is standard
+    contrast-limited adaptive histogram equalization, the same family of
+    technique used in astrophotography and thermal imaging to pull out
+    faint detail — not a physics claim.
+    field01: 2D float array in [0,1]. Returns 2D float array in [0,1].
+    """
+    u8 = np.clip(field01 * 255, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=max(0.1, clahe_clip), tileGridSize=(8, 8))
+    eq = clahe.apply(u8).astype(np.float32) / 255.0
+    mixed = (1 - blend) * field01 + blend * eq
+    return np.power(np.clip(mixed, 0, 1), gamma)
+
+def compute_psd_wheel(gray_full, mode, hue_shift, wheel_color_mode="orientation",
+                       primordial_clip=3.0, primordial_blend=0.6, primordial_gamma=0.45):
     """
     gray_full: full-resolution grayscale frame (uint8 or float, any size).
-    Returns: wheel_bgr (WHEEL_PX x WHEEL_PX x 3 uint8), peak_angle_deg, mean_power
+    wheel_color_mode:
+      "orientation" — hue = spatial-frequency orientation (original mode).
+      "primordial"  — hue = POWER itself, spread across the full 360-degree
+                       wheel after dynamic-range remap. Faint (low-power)
+                       content gets pulled into vivid, distinct hue instead
+                       of staying near-black; dominant (high-power) content
+                       gets compressed into a narrower band so it no longer
+                       overwhelms the display. Real image processing — see
+                       apply_dynamic_range_remap() docstring.
+    Returns: wheel_bgr, peak_angle_deg, mean_power
     """
     small = cv2.resize(gray_full, (N, N), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     F = np.fft.fftshift(np.fft.fft2(small))
@@ -85,12 +114,20 @@ def compute_psd_wheel(gray_full, mode, hue_shift):
     logmag = np.log1p(mag) / np.log1p(max_mag)
 
     power_field = logmag[_WHEEL_V, _WHEEL_U]
-    hue = (_WHEEL_HUE + hue_shift) % 360.0
-    if mode == "invert":
-        hue = (hue + 180.0) % 360.0
-        val = 1.0 - np.power(1.0 - power_field, 1.4)
+
+    if wheel_color_mode == "primordial":
+        remapped = apply_dynamic_range_remap(power_field, primordial_clip, primordial_blend, primordial_gamma)
+        hue = (remapped * 360.0 + hue_shift) % 360.0
+        val = np.power(np.clip(remapped, 0.05, 1.0), 0.7)  # keep faint bins visibly lit
+        if mode == "invert":
+            hue = (hue + 180.0) % 360.0
     else:
-        val = np.power(power_field, 0.85)
+        hue = (_WHEEL_HUE + hue_shift) % 360.0
+        if mode == "invert":
+            hue = (hue + 180.0) % 360.0
+            val = 1.0 - np.power(1.0 - power_field, 1.4)
+        else:
+            val = np.power(power_field, 0.85)
 
     hsv = np.zeros((WHEEL_PX, WHEEL_PX, 3), dtype=np.uint8)
     hsv[..., 0] = (hue / 2.0).astype(np.uint8)       # OpenCV hue range is 0-179
