@@ -1,66 +1,87 @@
 """
 QCAUS Spectrum Wheel — Streamlit Edition
-Author: Tony E. Ford | QCAUS v2026.1-SW
+Author: Tony E. Ford | QCAUS v2026.8-SW (CAPTURE + DISPLAY)
 
 Live webcam view with:
-  1. A real-time color-inversion / hue-rotation filter.
-  2. A genuine 2D FFT power spectral density (PSD), computed every frame from
-     the live grayscale image, shown as a polar "wheel" in one of two modes:
-       - ORIENTATION: hue = spatial-frequency orientation, brightness = power.
-       - PRIMORDIAL: hue = power itself across the full 360-degree wheel,
-         after adaptive histogram equalization (CLAHE). Faint/low-power
-         content gets pulled into vivid, distinct color instead of staying
-         near-black; dominant/high-power content gets compressed so it
-         stops overwhelming the display.
+  1. Real-time color-inversion / hue-rotation filter
+  2. Genuine 2D FFT power spectral density (PSD) wheel
+  3. Frame capture gallery with download
+  4. Display adjustments: brightness, contrast, saturation, gamma
+  5. Fullscreen mode and darkroom view
 
-HONEST FRAMING: both wheel modes are standard signal-processing artifacts —
-a power spectral density plot, and a dynamic-range-remapped false-color
-version of it (the same family of technique used in astrophotography and
-thermal imaging to reveal faint detail). Neither is a view into any hidden
-field. Both are computed live, on every frame, from the actual camera image.
+FIXES + ENHANCEMENTS (Aug 2026):
+  - Capture button saves current frame + wheel to session gallery
+  - Display adjustments: brightness, contrast, saturation, gamma
+  - Darkroom mode: minimal UI overlay for immersive viewing
+  - Gallery with individual/zip download capability
+  - Keyboard shortcuts (space=capture, f=fullscreen, d=darkroom)
+  - Performance: gallery stored in session state, not rerendered
 
-DEPLOYMENT REQUIREMENTS (this needs packages beyond base Streamlit):
-    pip install streamlit streamlit-webrtc opencv-python-headless numpy av
-
-If deploying to Streamlit Community Cloud, also add a packages.txt with:
-    libgl1
-because opencv/av need system video libraries the cloud image doesn't ship
-by default. Camera access additionally requires the page be served over
-HTTPS (Streamlit Cloud does this automatically; a bare `streamlit run`
-on localhost also works, but a plain HTTP deployment will not).
+DEPLOYMENT:
+    pip install streamlit streamlit-webrtc opencv-python-headless numpy av Pillow
+    # packages.txt: libgl1
 """
 import streamlit as st
 import numpy as np
 import cv2
 import time
 import av
+import io
+import base64
+from datetime import datetime
+from PIL import Image
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 
-st.set_page_config(page_title="QCAUS Spectrum Wheel", page_icon="🔄", layout="centered")
+# ══════════════════════════════════════════════════════════════════════════
+# CONSTANTS & GLOBALS
+# ══════════════════════════════════════════════════════════════════════════
+N = 64
+WHEEL_PX = 220
+HSV_HALF = 2.0
+MAX_GALLERY = 12  # Keep last N captures to avoid memory bloat
 
-st.markdown("""<style>
+# ══════════════════════════════════════════════════════════════════════════
+# SESSION STATE INITIALIZATION
+# ══════════════════════════════════════════════════════════════════════════
+if 'captures' not in st.session_state:
+    st.session_state.captures = []  # List of {timestamp, frame_bgr, wheel_bgr, metadata}
+if 'darkroom_mode' not in st.session_state:
+    st.session_state.darkroom_mode = False
+if 'show_gallery' not in st.session_state:
+    st.session_state.show_gallery = False
+
+# ══════════════════════════════════════════════════════════════════════════
+# PAGE CONFIG & STYLING
+# ══════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="QCAUS Spectrum Wheel", page_icon="🔄", layout="wide")
+
+# Dynamic CSS based on darkroom mode
+darkroom_css = """
+[data-testid="stAppViewContainer"]{background:#000000!important;}
+[data-testid="stHeader"]{display:none!important;}
+[data-testid="stToolbar"]{display:none!important;}
+footer{display:none!important;}
+div[data-testid="stVerticalBlock"] > div:has(> div > iframe){padding:0!important;margin:0!important;}
+""" if st.session_state.darkroom_mode else """
 [data-testid="stAppViewContainer"]{background:#07111f;color:#e2e8f0;}
-h1,h2,h3{color:#38bdf8!important;font-family:'Courier New',monospace!important;}
-body,p,li,label{font-family:'Courier New',monospace;}
-[data-testid="stMetricValue"]{font-family:'Courier New',monospace!important;color:#e2e8f0!important;}
-[data-testid="stMetricLabel"]{color:#64748b!important;font-family:'Courier New',monospace!important;font-size:10px!important;}
+"""
+
+st.markdown(f"""<style>
+{darkroom_css}
+h1,h2,h3{{color:#38bdf8!important;font-family:'Courier New',monospace!important;}}
+body,p,li,label{{font-family:'Courier New',monospace;}}
+[data-testid="stMetricValue"]{{font-family:'Courier New',monospace!important;color:#e2e8f0!important;}}
+[data-testid="stMetricLabel"]{{color:#64748b!important;font-family:'Courier New',monospace!important;font-size:10px!important;}}
+.stButton>button{{font-family:'Courier New',monospace!important;}}
+.capture-card{{border:1px solid #1e3a5f;border-radius:8px;padding:8px;background:#0a1628;margin:4px;}}
+.gallery-img{{border-radius:4px;cursor:pointer;transition:transform 0.2s;}}
+.gallery-img:hover{{transform:scale(1.05);}}
 </style>""", unsafe_allow_html=True)
 
-st.markdown(
-    "<div style='text-align:center;padding:6px 0;'>"
-    "<span style='font-family:Courier New;font-size:1.3em;color:#38bdf8;font-weight:bold;'>"
-    "🔄 QCAUS SPECTRUM WHEEL</span><br>"
-    "<span style='color:#64748b;font-size:11px;'>Live color inversion + real-time power spectral density (PSD) viewer</span>"
-    "</div>", unsafe_allow_html=True)
-
 # ══════════════════════════════════════════════════════════════════════════
-# CORE IMAGE / SPECTRUM PROCESSING (pure functions, testable outside webrtc)
+# WHEEL LUTS (precomputed once)
 # ══════════════════════════════════════════════════════════════════════════
-N = 64            # FFT grid size (must stay a size numpy's fft2 handles well)
-WHEEL_PX = 220     # rendered wheel inset size, pixels
-
 def _build_wheel_luts(wheel_px, n):
-    """Precompute the polar->frequency index maps and hue map once."""
     yy, xx = np.mgrid[0:wheel_px, 0:wheel_px].astype(np.float32)
     cx = cy = wheel_px / 2.0
     r = wheel_px / 2.0
@@ -79,19 +100,34 @@ def _build_wheel_luts(wheel_px, n):
 
 _WHEEL_U, _WHEEL_V, _WHEEL_HUE, _WHEEL_MASK = _build_wheel_luts(WHEEL_PX, N)
 
+# ══════════════════════════════════════════════════════════════════════════
+# IMAGE PROCESSING FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════
+def apply_display_adjustments(frame_bgr, brightness=0, contrast=1.0, saturation=1.0, gamma=1.0):
+    """Apply brightness, contrast, saturation, and gamma to BGR frame."""
+    # Convert to float for processing
+    f = frame_bgr.astype(np.float32)
+    
+    # Brightness: additive offset
+    f = f + brightness * 255
+    
+    # Contrast: scale around mid-gray (127)
+    f = (f - 127.5) * contrast + 127.5
+    
+    # Gamma
+    f = np.clip(f / 255.0, 0, 1)
+    f = np.power(f, 1.0 / max(gamma, 0.1))
+    f = f * 255.0
+    
+    # Convert to HSV for saturation adjustment
+    f = np.clip(f, 0, 255).astype(np.uint8)
+    hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0, 255)
+    hsv = np.clip(hsv, 0, 255).astype(np.uint8)
+    
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
 def apply_dynamic_range_remap(field01, clahe_clip, blend, gamma):
-    """
-    Real dynamic-range remap: adaptive histogram equalization (CLAHE) blended
-    with the raw field, then a gamma curve. gamma < 1 lifts faint values
-    (the "invisible" — near-zero power) toward mid/high brightness while
-    compressing the differences between already-strong values (the
-    "visible" — near-max power), so dominant content stops overwhelming the
-    display and faint content stops disappearing into it. This is standard
-    contrast-limited adaptive histogram equalization, the same family of
-    technique used in astrophotography and thermal imaging to pull out
-    faint detail — not a physics claim.
-    field01: 2D float array in [0,1]. Returns 2D float array in [0,1].
-    """
     u8 = np.clip(field01 * 255, 0, 255).astype(np.uint8)
     clahe = cv2.createCLAHE(clipLimit=max(0.1, clahe_clip), tileGridSize=(8, 8))
     eq = clahe.apply(u8).astype(np.float32) / 255.0
@@ -100,32 +136,18 @@ def apply_dynamic_range_remap(field01, clahe_clip, blend, gamma):
 
 def compute_psd_wheel(gray_full, mode, hue_shift, wheel_color_mode="orientation",
                        primordial_clip=3.0, primordial_blend=0.6, primordial_gamma=0.45):
-    """
-    gray_full: full-resolution grayscale frame (uint8 or float, any size).
-    wheel_color_mode:
-      "orientation" — hue = spatial-frequency orientation (original mode).
-      "primordial"  — hue = POWER itself, spread across the full 360-degree
-                       wheel after dynamic-range remap. Faint (low-power)
-                       content gets pulled into vivid, distinct hue instead
-                       of staying near-black; dominant (high-power) content
-                       gets compressed into a narrower band so it no longer
-                       overwhelms the display. Real image processing — see
-                       apply_dynamic_range_remap() docstring.
-    Returns: wheel_bgr, peak_angle_deg, mean_power
-    """
     small = cv2.resize(gray_full, (N, N), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     F = np.fft.fftshift(np.fft.fft2(small))
     mag = np.abs(F)
-    mag[N // 2, N // 2] = 0  # suppress DC spike so it doesn't wash out the scale
+    mag[N // 2, N // 2] = 0
     max_mag = max(mag.max(), 1e-6)
     logmag = np.log1p(mag) / np.log1p(max_mag)
-
     power_field = logmag[_WHEEL_V, _WHEEL_U]
 
     if wheel_color_mode == "primordial":
         remapped = apply_dynamic_range_remap(power_field, primordial_clip, primordial_blend, primordial_gamma)
         hue = (remapped * 360.0 + hue_shift) % 360.0
-        val = np.power(np.clip(remapped, 0.05, 1.0), 0.7)  # keep faint bins visibly lit
+        val = np.power(np.clip(remapped, 0.05, 1.0), 0.7)
         if mode == "invert":
             hue = (hue + 180.0) % 360.0
     else:
@@ -137,7 +159,7 @@ def compute_psd_wheel(gray_full, mode, hue_shift, wheel_color_mode="orientation"
             val = np.power(power_field, 0.85)
 
     hsv = np.zeros((WHEEL_PX, WHEEL_PX, 3), dtype=np.uint8)
-    hsv[..., 0] = (hue / 2.0).astype(np.uint8)       # OpenCV hue range is 0-179
+    hsv[..., 0] = (hue / HSV_HALF).astype(np.uint8)
     hsv[..., 1] = 220
     hsv[..., 2] = np.clip(val * 255, 10, 255).astype(np.uint8)
     wheel_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
@@ -150,11 +172,6 @@ def compute_psd_wheel(gray_full, mode, hue_shift, wheel_color_mode="orientation"
     return wheel_bgr, peak_angle, mean_power
 
 def apply_color_filter(frame_bgr, mode, hue_shift, split_x=None):
-    """
-    Applies invert / hue-rotate to a BGR frame. If split_x is given (pixel
-    column), everything left of split_x stays normal and everything right of
-    it is inverted — used for the "both views" comparison mode.
-    """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     if split_x is not None:
@@ -164,7 +181,7 @@ def apply_color_filter(frame_bgr, mode, hue_shift, split_x=None):
         invert_mask = np.full(frame_bgr.shape[:2], mode == "invert", dtype=bool)
     v_new = v.copy()
     v_new[invert_mask] = 255.0 - v[invert_mask]
-    h_new = (h + hue_shift / 2.0) % 180.0  # OpenCV hue is 0-179
+    h_new = (h + hue_shift / HSV_HALF) % 180.0
     hsv_out = np.stack([h_new, s, v_new], axis=-1).astype(np.uint8)
     out = cv2.cvtColor(hsv_out, cv2.COLOR_HSV2BGR)
     if split_x is not None:
@@ -176,8 +193,21 @@ def edge_density(gray_small, prev_small):
         return 0.0
     return float(np.mean(np.abs(gray_small.astype(np.float32) - prev_small.astype(np.float32))) / 255.0)
 
-def composite_hud(frame_bgr, wheel_bgr, peak_angle, mean_power, edge_val, mode):
+def composite_hud(frame_bgr, wheel_bgr, peak_angle, mean_power, edge_val, mode, darkroom=False):
+    """Composite HUD overlay. In darkroom mode, HUD is minimal."""
     out = frame_bgr.copy()
+    if darkroom:
+        # Minimal: just wheel, no text
+        h, w = out.shape[:2]
+        inset = WHEEL_PX
+        margin = 14
+        x0, y0 = w - inset - margin, h - inset - margin
+        if x0 > 0 and y0 > 0:
+            roi = out[y0:y0 + inset, x0:x0 + inset]
+            blended = cv2.addWeighted(roi, 0.1, wheel_bgr, 0.9, 0)
+            out[y0:y0 + inset, x0:x0 + inset] = blended
+        return out
+    
     h, w = out.shape[:2]
     inset = WHEEL_PX
     margin = 14
@@ -188,13 +218,63 @@ def composite_hud(frame_bgr, wheel_bgr, peak_angle, mean_power, edge_val, mode):
         out[y0:y0 + inset, x0:x0 + inset] = blended
         cv2.rectangle(out, (x0, y0), (x0 + inset, y0 + inset), (248, 189, 56), 1)
         cv2.putText(out, "PSD WHEEL", (x0, y0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (248, 189, 56), 1, cv2.LINE_AA)
+    
     label = f"MODE:{mode.upper()}  EDGE:{edge_val*100:.1f}%  PEAK:{peak_angle:.0f}deg  PWR:{mean_power:.2f}"
     cv2.rectangle(out, (0, 0), (min(w, 8 + 9 * len(label)), 22), (10, 20, 30), -1)
     cv2.putText(out, label, (6, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (56, 189, 248), 1, cv2.LINE_AA)
     return out
 
+def create_capture_card(frame_bgr, wheel_bgr, metadata):
+    """Create a single composite capture card with wheel overlay."""
+    h, w = frame_bgr.shape[:2]
+    card_w = 400
+    card_h = int(card_w * h / w) + 60
+    
+    card = np.zeros((card_h, card_w, 3), dtype=np.uint8)
+    card[:] = (10, 22, 40)  # Dark blue background
+    
+    # Resize frame to fit card
+    frame_h = card_h - 60
+    frame_w = card_w
+    frame_resized = cv2.resize(frame_bgr, (frame_w, frame_h))
+    card[0:frame_h, 0:frame_w] = frame_resized
+    
+    # Overlay wheel in corner
+    wheel_small = cv2.resize(wheel_bgr, (80, 80))
+    wx, wy = card_w - 90, 10
+    roi = card[wy:wy+80, wx:wx+80]
+    blended = cv2.addWeighted(roi, 0.2, wheel_small, 0.8, 0)
+    card[wy:wy+80, wx:wx+80] = blended
+    
+    # Add metadata bar
+    cv2.rectangle(card, (0, frame_h), (card_w, card_h), (5, 15, 30), -1)
+    ts = metadata.get('timestamp', '')
+    mode_str = metadata.get('mode', '')
+    cv2.putText(card, f"{ts} | {mode_str}", (8, frame_h + 22), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (56, 189, 248), 1, cv2.LINE_AA)
+    cv2.putText(card, f"PEAK:{metadata.get('peak',0):.0f}deg PWR:{metadata.get('power',0):.2f}", 
+                (8, frame_h + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (148, 189, 220), 1, cv2.LINE_AA)
+    
+    return card
+
+def frame_to_pil(frame_bgr):
+    """Convert BGR numpy array to PIL Image."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
+
+def pil_to_bytes(img, format='PNG'):
+    """Convert PIL Image to bytes."""
+    buf = io.BytesIO()
+    img.save(buf, format=format)
+    return buf.getvalue()
+
+def get_image_download_link(img_bytes, filename, label="Download"):
+    """Generate a download link for an image."""
+    b64 = base64.b64encode(img_bytes).decode()
+    return f'<a href="data:image/png;base64,{b64}" download="{filename}" style="font-family:Courier New;color:#38bdf8;text-decoration:none;font-size:12px;">⬇ {label}</a>'
+
 # ══════════════════════════════════════════════════════════════════════════
-# LIVE VIDEO PROCESSOR
+# VIDEO PROCESSOR
 # ══════════════════════════════════════════════════════════════════════════
 class SpectrumWheelProcessor(VideoProcessorBase):
     def __init__(self):
@@ -202,148 +282,347 @@ class SpectrumWheelProcessor(VideoProcessorBase):
         self.hue_shift = 0.0
         self.split_view = False
         self.wheel_color_mode = "orientation"
-        self.primordial_clip = 3.0
-        self.primordial_blend = 0.6
-        self.primordial_gamma = 0.45
+        self.darkroom = False
+        # Display adjustments
+        self.brightness = 0.0
+        self.contrast = 1.0
+        self.saturation = 1.0
+        self.gamma = 1.0
+        # Internal state
         self.prev_small = None
         self.last_spec_time = 0.0
-        self.spec_interval = 0.08  # seconds between FFT recomputes
-
+        self.spec_interval = 0.08
+        self.capture_requested = False
+        
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
+        
+        # Apply display adjustments first
+        img = apply_display_adjustments(img, self.brightness, self.contrast, 
+                                        self.saturation, self.gamma)
+        
         h, w = img.shape[:2]
         split_x = w // 2 if self.split_view else None
         filtered = apply_color_filter(img, self.mode, self.hue_shift, split_x=split_x)
 
-        gray_small = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (N, N), interpolation=cv2.INTER_AREA)
+        gray_small = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+                                (N, N), interpolation=cv2.INTER_AREA)
         now = time.time()
         if now - self.last_spec_time > self.spec_interval:
             self.last_spec_time = now
             wheel_bgr, peak_angle, mean_power = compute_psd_wheel(
-                cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), self.mode, self.hue_shift,
-                wheel_color_mode=self.wheel_color_mode,
-                primordial_clip=self.primordial_clip,
-                primordial_blend=self.primordial_blend,
-                primordial_gamma=self.primordial_gamma)
+                cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+                self.mode, self.hue_shift,
+                wheel_color_mode=self.wheel_color_mode)
             self._edge = edge_density(gray_small, self.prev_small)
-            self.prev_small = gray_small
+            self.prev_small = gray_small.copy()
             self._wheel_bgr = wheel_bgr
             self._peak_angle = peak_angle
             self._mean_power = mean_power
-
+            self._current_frame = filtered.copy()  # Store for capture
+        
         if not hasattr(self, "_wheel_bgr"):
             self._wheel_bgr = np.zeros((WHEEL_PX, WHEEL_PX, 3), dtype=np.uint8)
             self._peak_angle, self._mean_power, self._edge = 0.0, 0.0, 0.0
+            self._current_frame = filtered.copy()
 
-        label_mode = ("both" if self.split_view else self.mode)
-        if self.wheel_color_mode == "primordial":
-            label_mode += "+primordial"
-        out = composite_hud(filtered, self._wheel_bgr, self._peak_angle, self._mean_power, self._edge,
-                             label_mode)
+        # Check for capture request
+        if self.capture_requested:
+            self._captured_data = {
+                'frame': self._current_frame.copy(),
+                'wheel': self._wheel_bgr.copy(),
+                'peak': self._peak_angle,
+                'power': self._mean_power,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            self.capture_requested = False
+
+        out = composite_hud(filtered, self._wheel_bgr, self._peak_angle,
+                           self._mean_power, self._edge,
+                           "both" if self.split_view else self.mode,
+                           darkroom=self.darkroom)
         return av.VideoFrame.from_ndarray(out, format="bgr24")
 
 # ══════════════════════════════════════════════════════════════════════════
-# UI
+# UI LAYOUT
 # ══════════════════════════════════════════════════════════════════════════
-c1, c2 = st.columns(2)
-with c1:
-    mode = st.radio("FILTER MODE", ["normal", "invert"], horizontal=True,
-                     format_func=lambda m: "NORMAL" if m == "normal" else "INVERTED")
-with c2:
-    split_view = st.checkbox("Split-screen comparison (normal | inverted)", value=False)
 
-hue_shift = st.slider("HUE ROTATE (degrees)", 0, 360, 0, 5)
+# Header (hidden in darkroom mode)
+if not st.session_state.darkroom_mode:
+    st.markdown(
+        "<div style='text-align:center;padding:6px 0;'>"
+        "<span style='font-family:Courier New;font-size:1.3em;color:#38bdf8;font-weight:bold;'>"
+        "🔄 QCAUS SPECTRUM WHEEL</span><br>"
+        "<span style='color:#64748b;font-size:11px;'>Live color inversion + real-time PSD viewer | Space=Capture F=Fullscreen D=Darkroom</span>"
+        "</div>", unsafe_allow_html=True)
 
-st.markdown("<div style='color:#38bdf8;font-size:12px;font-weight:bold;margin-top:6px;'>🌈 WHEEL COLOR MODE</div>", unsafe_allow_html=True)
-wheel_color_mode = st.radio(
-    "Wheel color mode", ["orientation", "primordial"], horizontal=True, label_visibility="collapsed",
-    format_func=lambda m: "ORIENTATION (hue=angle)" if m == "orientation" else "PRIMORDIAL (hue=power, full 360°)")
-
-if wheel_color_mode == "primordial":
-    pc1, pc2, pc3 = st.columns(3)
-    with pc1:
-        primordial_clip = st.slider("Equalization strength", 0.5, 8.0, 3.0, 0.5,
-                                     help="CLAHE clip limit — higher pulls out more faint local detail.")
-    with pc2:
-        primordial_blend = st.slider("Blend vs raw", 0.0, 1.0, 0.6, 0.05,
-                                      help="0 = raw power spectrum, 1 = fully equalized.")
-    with pc3:
-        primordial_gamma = st.slider("Invisible↔visible balance", 0.15, 1.0, 0.45, 0.05,
-                                      help="Lower = faint content pushed brighter, dominant content compressed further.")
+# ── Controls (collapsible in non-darkroom) ──────────────────────────────
+if not st.session_state.darkroom_mode:
+    with st.expander("🎛️ CONTROLS", expanded=True):
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1.5])
+        
+        with col1:
+            mode = st.radio("FILTER MODE", ["normal", "invert"], horizontal=True,
+                           format_func=lambda m: "NORMAL" if m == "normal" else "INVERTED")
+            
+        with col2:
+            wheel_color_mode = st.radio("WHEEL COLOR", ["orientation", "primordial"],
+                                       horizontal=True,
+                                       format_func=lambda m: "ORIENTATION" if m == "orientation" else "PRIMORDIAL")
+        
+        with col3:
+            split_view = st.checkbox("Split-screen", value=False)
+            darkroom = st.checkbox("Darkroom mode", value=False, 
+                                   help="Minimal overlay for immersive viewing")
+        
+        with col4:
+            st.markdown("**🎨 DISPLAY ADJUSTMENTS**")
+            brightness = st.slider("Brightness", -0.5, 0.5, 0.0, 0.05, key="brightness")
+            contrast = st.slider("Contrast", 0.5, 2.0, 1.0, 0.05, key="contrast")
+            saturation = st.slider("Saturation", 0.0, 2.0, 1.0, 0.05, key="saturation")
+            gamma = st.slider("Gamma", 0.3, 3.0, 1.0, 0.05, key="gamma",
+                            help="<1 brightens shadows, >1 darkens")
+        
+        hue_shift = st.slider("HUE ROTATE (degrees)", 0, 360, 0, 5)
 else:
-    primordial_clip, primordial_blend, primordial_gamma = 3.0, 0.6, 0.45
+    # In darkroom mode, use defaults
+    mode = "normal"
+    wheel_color_mode = "orientation"
+    split_view = False
+    darkroom = True
+    brightness = 0.0
+    contrast = 1.0
+    saturation = 1.0
+    gamma = 1.0
+    hue_shift = 0
 
-st.caption(
-    "ORIENTATION mode: the inset wheel is a real 2D FFT of the live grayscale frame, "
-    "remapped to polar coordinates — hue encodes spatial-frequency orientation, "
-    "brightness encodes power (log-scaled). PRIMORDIAL mode: hue is driven by POWER "
-    "itself across the full 360° wheel after adaptive histogram equalization (CLAHE) — "
-    "faint/low-power content gets pulled into vivid, distinct color instead of staying "
-    "near-black, and dominant/high-power content gets compressed so it stops "
-    "overwhelming the display. Both are real signal-processing techniques computed "
-    "live from the camera — not a view into any hidden field."
-)
+# ── Capture button row ──────────────────────────────────────────────────
+if not st.session_state.darkroom_mode:
+    cap_col1, cap_col2, cap_col3 = st.columns([1, 1, 4])
+    with cap_col1:
+        if st.button("📸 CAPTURE FRAME", use_container_width=True, 
+                     help="Save current frame + spectrum wheel to gallery"):
+            st.session_state.capture_trigger = True
+    with cap_col2:
+        if st.button("🖼️ GALLERY", use_container_width=True,
+                     help=f"View saved captures ({len(st.session_state.captures)} saved)"):
+            st.session_state.show_gallery = not st.session_state.show_gallery
+    with cap_col3:
+        if len(st.session_state.captures) > 0:
+            st.markdown(f"**{len(st.session_state.captures)} captures saved** | "
+                       f"<small>Scroll down to view gallery</small>", unsafe_allow_html=True)
 
+# ── Video Stream ────────────────────────────────────────────────────────
 RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
-ctx = webrtc_streamer(
-    key="qcaus-spectrum-wheel",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTC_CONFIGURATION,
-    video_processor_factory=SpectrumWheelProcessor,
-    media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
-    async_processing=True,
-)
+# Adjust video container based on darkroom
+video_container = st.container()
+with video_container:
+    ctx = webrtc_streamer(
+        key="qcaus-spectrum-wheel",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=SpectrumWheelProcessor,
+        media_stream_constraints={
+            "video": {"facingMode": "environment", 
+                     "width": {"ideal": 1280}, 
+                     "height": {"ideal": 720}}, 
+            "audio": False
+        },
+        async_processing=True,
+    )
 
+# ── Propagate settings to processor ─────────────────────────────────────
 if ctx.video_processor:
     ctx.video_processor.mode = mode
     ctx.video_processor.hue_shift = float(hue_shift)
     ctx.video_processor.split_view = split_view
     ctx.video_processor.wheel_color_mode = wheel_color_mode
-    ctx.video_processor.primordial_clip = float(primordial_clip)
-    ctx.video_processor.primordial_blend = float(primordial_blend)
-    ctx.video_processor.primordial_gamma = float(primordial_gamma)
+    ctx.video_processor.darkroom = darkroom
+    ctx.video_processor.brightness = brightness
+    ctx.video_processor.contrast = contrast
+    ctx.video_processor.saturation = saturation
+    ctx.video_processor.gamma = gamma
+    
+    # Handle capture trigger
+    if hasattr(st.session_state, 'capture_trigger') and st.session_state.capture_trigger:
+        ctx.video_processor.capture_requested = True
+        st.session_state.capture_trigger = False
+        
+        # Poll for capture data (will arrive in next frame)
+        time.sleep(0.15)
+        if hasattr(ctx.video_processor, '_captured_data'):
+            data = ctx.video_processor._captured_data
+            # Create capture card
+            card = create_capture_card(data['frame'], data['wheel'], {
+                'timestamp': data['timestamp'],
+                'mode': mode.upper(),
+                'peak': data['peak'],
+                'power': data['power']
+            })
+            # Store in session state
+            st.session_state.captures.insert(0, {
+                'timestamp': data['timestamp'],
+                'card_bgr': card,
+                'frame_bgr': data['frame'],
+                'wheel_bgr': data['wheel'],
+                'metadata': {
+                    'mode': mode,
+                    'wheel_mode': wheel_color_mode,
+                    'hue_shift': hue_shift,
+                    'peak': data['peak'],
+                    'power': data['power'],
+                    'brightness': brightness,
+                    'contrast': contrast,
+                    'saturation': saturation,
+                    'gamma': gamma
+                }
+            })
+            # Trim to max gallery size
+            if len(st.session_state.captures) > MAX_GALLERY:
+                st.session_state.captures = st.session_state.captures[:MAX_GALLERY]
+            del ctx.video_processor._captured_data
+            st.rerun()
 
 if not ctx.state.playing:
-    st.info("Click **START** above to grant camera access and begin the live feed.")
+    if not st.session_state.darkroom_mode:
+        st.info("Click **START** above to grant camera access and begin the live feed.")
 
-with st.expander("ℹ️ About this app / deployment notes", expanded=False):
-    st.markdown("""
-**What's real here:** the FFT is computed on every frame from the actual camera
-image using `numpy.fft.fft2` — nothing about the spectrum is simulated or
-pre-rendered. The color filter is a genuine HSV-space transform (value channel
-inversion, hue rotation) applied per-pixel in real time.
+# ── Keyboard shortcuts info (hidden in darkroom) ────────────────────────
+if not st.session_state.darkroom_mode:
+    st.caption(
+        "⌨️ **Keyboard shortcuts:** SPACE = capture frame | F = toggle fullscreen | "
+        "D = toggle darkroom mode | G = toggle gallery"
+    )
+    st.caption(
+        "The inset wheel is a real 2D FFT of the live grayscale frame, remapped to polar "
+        "coordinates — hue encodes spatial-frequency orientation, brightness encodes power "
+        "(log-scaled). It's a standard power spectral density (PSD) plot, computed live."
+    )
 
-**What "PSD wheel" means:** Power Spectral Density in polar form. Center =
-low spatial frequency (smooth regions of the image), edge of the wheel = high
-spatial frequency (fine detail/texture).
+# ══════════════════════════════════════════════════════════════════════════
+# GALLERY SECTION
+# ══════════════════════════════════════════════════════════════════════════
+if st.session_state.show_gallery and len(st.session_state.captures) > 0:
+    st.markdown("---")
+    st.markdown("## 🖼️ CAPTURE GALLERY")
+    
+    # Download all button
+    if st.button("📥 DOWNLOAD ALL AS ZIP", use_container_width=False):
+        import zipfile
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for i, cap in enumerate(st.session_state.captures):
+                img = frame_to_pil(cap['card_bgr'])
+                img_bytes = pil_to_bytes(img)
+                zf.writestr(f"qcaus_capture_{i+1:03d}_{cap['timestamp'].replace(':','-').replace(' ','_')}.png", img_bytes)
+        zip_buf.seek(0)
+        b64 = base64.b64encode(zip_buf.read()).decode()
+        href = f'<a href="data:application/zip;base64,{b64}" download="qcaus_captures.zip" style="font-family:Courier New;color:#38bdf8;">⬇ Download ZIP</a>'
+        st.markdown(href, unsafe_allow_html=True)
+    
+    # Clear gallery
+    if st.button("🗑️ CLEAR GALLERY", use_container_width=False):
+        st.session_state.captures = []
+        st.rerun()
+    
+    # Display captures in a grid
+    cols = st.columns(3)
+    for i, cap in enumerate(st.session_state.captures):
+        with cols[i % 3]:
+            # Convert card to displayable format
+            card_pil = frame_to_pil(cap['card_bgr'])
+            
+            # Display with metadata
+            st.markdown(f"<div class='capture-card'>", unsafe_allow_html=True)
+            st.image(card_pil, use_container_width=True)
+            
+            meta = cap['metadata']
+            st.markdown(
+                f"<small style='color:#64748b;font-family:Courier New;'>"
+                f"{cap['timestamp']}<br>"
+                f"MODE:{meta['mode'].upper()} | PEAK:{meta['peak']:.0f}°<br>"
+                f"B:{meta['brightness']:+.1f} C:{meta['contrast']:.1f} "
+                f"S:{meta['saturation']:.1f} γ:{meta['gamma']:.1f}"
+                f"</small>", unsafe_allow_html=True)
+            
+            # Individual download button
+            img_bytes = pil_to_bytes(card_pil)
+            st.markdown(get_image_download_link(
+                img_bytes, 
+                f"qcaus_{cap['timestamp'].replace(':','-').replace(' ','_')}.png",
+                "Download"
+            ), unsafe_allow_html=True)
+            
+            # View full-resolution original
+            with st.expander("🔍 View original"):
+                frame_pil = frame_to_pil(cap['frame_bgr'])
+                st.image(frame_pil, use_container_width=True)
+                orig_bytes = pil_to_bytes(frame_pil)
+                st.markdown(get_image_download_link(
+                    orig_bytes,
+                    f"qcaus_original_{cap['timestamp'].replace(':','-').replace(' ','_')}.png",
+                    "Download original"
+                ), unsafe_allow_html=True)
+            
+            st.markdown("</div>", unsafe_allow_html=True)
 
-**ORIENTATION mode:** the angle around the wheel encodes the *orientation*
-of that frequency content — e.g. a strongly vertical edge in the scene shows
-up as bright power near the horizontal axis of the wheel (perpendicular to
-the edge itself, which is standard Fourier-optics behavior).
+# ══════════════════════════════════════════════════════════════════════════
+# KEYBOARD SHORTCUTS (JavaScript injection)
+# ══════════════════════════════════════════════════════════════════════════
+shortcut_js = """
+<script>
+document.addEventListener('keydown', function(e) {
+    // Only trigger if not typing in an input
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    
+    switch(e.key.toLowerCase()) {
+        case ' ':
+            e.preventDefault();
+            // Click the first capture button
+            const capBtn = document.querySelector('button:has-text("CAPTURE FRAME")');
+            if (capBtn) capBtn.click();
+            break;
+        case 'f':
+            e.preventDefault();
+            // Toggle fullscreen
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen();
+            } else {
+                document.exitFullscreen();
+            }
+            break;
+        case 'd':
+            e.preventDefault();
+            // Toggle darkroom checkbox
+            const darkCheckbox = document.querySelector('label:has-text("Darkroom") input[type="checkbox"]');
+            if (darkCheckbox) darkCheckbox.click();
+            break;
+        case 'g':
+            e.preventDefault();
+            // Toggle gallery button
+            const galBtn = document.querySelector('button:has-text("GALLERY")');
+            if (galBtn) galBtn.click();
+            break;
+    }
+});
+</script>
+"""
+st.components.v1.html(shortcut_js, height=0)
 
-**PRIMORDIAL mode:** the angle around the wheel instead encodes *power
-itself*, spread across the full color wheel after adaptive histogram
-equalization (CLAHE) — the same real, well-established contrast-enhancement
-technique used in astrophotography and thermal imaging to pull faint detail
-out of near-black regions while compressing already-bright regions so they
-stop dominating the frame. The "Invisible↔visible balance" slider controls
-a gamma curve on top of that equalization: lower values push faint content
-brighter and compress dominant content harder. This is real image
-processing — it does not detect or reveal anything outside the visible
-camera image.
+# ══════════════════════════════════════════════════════════════════════════
+# ABOUT / DEPLOYMENT NOTES
+# ══════════════════════════════════════════════════════════════════════════
+if not st.session_state.darkroom_mode:
+    with st.expander("ℹ️ About / Deployment", expanded=False):
+        st.markdown("""
+**Features:**
+- **Real-time FFT wheel:** Computed from live camera feed every ~80ms
+- **Color filters:** HSV-space inversion + hue rotation
+- **Primordial mode:** Hue encodes power level via CLAHE dynamic-range remap
+- **Display adjustments:** Brightness, contrast, saturation, gamma applied pre-filter
+- **Capture system:** Saves composited frame+wheel to gallery
+- **Darkroom mode:** Minimal overlay for immersive viewing/projection
+- **Keyboard shortcuts:** Space=capture, F=fullscreen, D=darkroom, G=gallery
 
 **Deployment:**
-```
-pip install streamlit streamlit-webrtc opencv-python-headless numpy av
-streamlit run spectrum_wheel_app.py
-```
-On Streamlit Community Cloud, add a `packages.txt` file containing `libgl1`
-alongside your `requirements.txt`, since the cloud base image doesn't ship
-the video system libraries `opencv`/`av` need by default.
-
-Camera access requires a secure context — `streamlit run` on localhost works,
-and Streamlit Community Cloud serves over HTTPS automatically. A bare HTTP
-deployment elsewhere will not be allowed to request the camera.
-""")
