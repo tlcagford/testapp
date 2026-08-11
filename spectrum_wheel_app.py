@@ -15,7 +15,6 @@ FIXES + ENHANCEMENTS (Aug 2026):
   - Darkroom mode: minimal UI overlay for immersive viewing
   - Gallery with individual/zip download capability
   - Keyboard shortcuts (space=capture, f=fullscreen, d=darkroom)
-  - Performance: gallery stored in session state, not rerendered
 
 DEPLOYMENT:
     pip install streamlit streamlit-webrtc opencv-python-headless numpy av Pillow
@@ -28,6 +27,7 @@ import time
 import av
 import io
 import base64
+import zipfile
 from datetime import datetime
 from PIL import Image
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
@@ -49,6 +49,8 @@ if 'darkroom_mode' not in st.session_state:
     st.session_state.darkroom_mode = False
 if 'show_gallery' not in st.session_state:
     st.session_state.show_gallery = False
+if 'capture_trigger' not in st.session_state:
+    st.session_state.capture_trigger = False
 
 # ══════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG & STYLING
@@ -56,17 +58,21 @@ if 'show_gallery' not in st.session_state:
 st.set_page_config(page_title="QCAUS Spectrum Wheel", page_icon="🔄", layout="wide")
 
 # Dynamic CSS based on darkroom mode
-darkroom_css = """
-[data-testid="stAppViewContainer"]{background:#000000!important;}
-[data-testid="stHeader"]{display:none!important;}
-[data-testid="stToolbar"]{display:none!important;}
-footer{display:none!important;}
-div[data-testid="stVerticalBlock"] > div:has(> div > iframe){padding:0!important;margin:0!important;}
-""" if st.session_state.darkroom_mode else """
-[data-testid="stAppViewContainer"]{background:#07111f;color:#e2e8f0;}
-"""
+if st.session_state.darkroom_mode:
+    darkroom_css = """
+    [data-testid="stAppViewContainer"]{background:#000000!important;}
+    [data-testid="stHeader"]{display:none!important;}
+    [data-testid="stToolbar"]{display:none!important;}
+    footer{display:none!important;}
+    div[data-testid="stVerticalBlock"] > div:has(> div > iframe){padding:0!important;margin:0!important;}
+    """
+else:
+    darkroom_css = """
+    [data-testid="stAppViewContainer"]{background:#07111f;color:#e2e8f0;}
+    """
 
-st.markdown(f"""<style>
+st.markdown(
+    f"""<style>
 {darkroom_css}
 h1,h2,h3{{color:#38bdf8!important;font-family:'Courier New',monospace!important;}}
 body,p,li,label{{font-family:'Courier New',monospace;}}
@@ -76,7 +82,9 @@ body,p,li,label{{font-family:'Courier New',monospace;}}
 .capture-card{{border:1px solid #1e3a5f;border-radius:8px;padding:8px;background:#0a1628;margin:4px;}}
 .gallery-img{{border-radius:4px;cursor:pointer;transition:transform 0.2s;}}
 .gallery-img:hover{{transform:scale(1.05);}}
-</style>""", unsafe_allow_html=True)
+</style>""",
+    unsafe_allow_html=True,
+)
 
 # ══════════════════════════════════════════════════════════════════════════
 # WHEEL LUTS (precomputed once)
@@ -409,28 +417,28 @@ if not st.session_state.darkroom_mode:
             st.session_state.show_gallery = not st.session_state.show_gallery
     with cap_col3:
         if len(st.session_state.captures) > 0:
-            st.markdown(f"**{len(st.session_state.captures)} captures saved** | "
-                       f"<small>Scroll down to view gallery</small>", unsafe_allow_html=True)
+            st.markdown(
+                f"**{len(st.session_state.captures)} captures saved** | "
+                f"<small>Scroll down to view gallery</small>",
+                unsafe_allow_html=True
+            )
 
 # ── Video Stream ────────────────────────────────────────────────────────
 RTC_CONFIGURATION = {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 
-# Adjust video container based on darkroom
-video_container = st.container()
-with video_container:
-    ctx = webrtc_streamer(
-        key="qcaus-spectrum-wheel",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIGURATION,
-        video_processor_factory=SpectrumWheelProcessor,
-        media_stream_constraints={
-            "video": {"facingMode": "environment", 
-                     "width": {"ideal": 1280}, 
-                     "height": {"ideal": 720}}, 
-            "audio": False
-        },
-        async_processing=True,
-    )
+ctx = webrtc_streamer(
+    key="qcaus-spectrum-wheel",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CONFIGURATION,
+    video_processor_factory=SpectrumWheelProcessor,
+    media_stream_constraints={
+        "video": {"facingMode": "environment", 
+                 "width": {"ideal": 1280}, 
+                 "height": {"ideal": 720}}, 
+        "audio": False
+    },
+    async_processing=True,
+)
 
 # ── Propagate settings to processor ─────────────────────────────────────
 if ctx.video_processor:
@@ -445,7 +453,7 @@ if ctx.video_processor:
     ctx.video_processor.gamma = gamma
     
     # Handle capture trigger
-    if hasattr(st.session_state, 'capture_trigger') and st.session_state.capture_trigger:
+    if st.session_state.capture_trigger:
         ctx.video_processor.capture_requested = True
         st.session_state.capture_trigger = False
         
@@ -507,24 +515,32 @@ if st.session_state.show_gallery and len(st.session_state.captures) > 0:
     st.markdown("---")
     st.markdown("## 🖼️ CAPTURE GALLERY")
     
-    # Download all button
-    if st.button("📥 DOWNLOAD ALL AS ZIP", use_container_width=False):
-        import zipfile
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for i, cap in enumerate(st.session_state.captures):
-                img = frame_to_pil(cap['card_bgr'])
-                img_bytes = pil_to_bytes(img)
-                zf.writestr(f"qcaus_capture_{i+1:03d}_{cap['timestamp'].replace(':','-').replace(' ','_')}.png", img_bytes)
-        zip_buf.seek(0)
-        b64 = base64.b64encode(zip_buf.read()).decode()
-        href = f'<a href="data:application/zip;base64,{b64}" download="qcaus_captures.zip" style="font-family:Courier New;color:#38bdf8;">⬇ Download ZIP</a>'
-        st.markdown(href, unsafe_allow_html=True)
+    gal_col1, gal_col2 = st.columns([1, 1])
+    with gal_col1:
+        # Download all as zip
+        if st.button("📥 DOWNLOAD ALL AS ZIP", use_container_width=False):
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i, cap in enumerate(st.session_state.captures):
+                    img = frame_to_pil(cap['card_bgr'])
+                    img_bytes = pil_to_bytes(img)
+                    safe_ts = cap['timestamp'].replace(':', '-').replace(' ', '_')
+                    zf.writestr(f"qcaus_capture_{i+1:03d}_{safe_ts}.png", img_bytes)
+            zip_buf.seek(0)
+            b64 = base64.b64encode(zip_buf.read()).decode()
+            href = (
+                f'<a href="data:application/zip;base64,{b64}" '
+                f'download="qcaus_captures.zip" '
+                f'style="font-family:Courier New;color:#38bdf8;">'
+                f'⬇ Download ZIP</a>'
+            )
+            st.markdown(href, unsafe_allow_html=True)
     
-    # Clear gallery
-    if st.button("🗑️ CLEAR GALLERY", use_container_width=False):
-        st.session_state.captures = []
-        st.rerun()
+    with gal_col2:
+        # Clear gallery
+        if st.button("🗑️ CLEAR GALLERY", use_container_width=False):
+            st.session_state.captures = []
+            st.rerun()
     
     # Display captures in a grid
     cols = st.columns(3)
@@ -534,36 +550,45 @@ if st.session_state.show_gallery and len(st.session_state.captures) > 0:
             card_pil = frame_to_pil(cap['card_bgr'])
             
             # Display with metadata
-            st.markdown(f"<div class='capture-card'>", unsafe_allow_html=True)
+            st.markdown("<div class='capture-card'>", unsafe_allow_html=True)
             st.image(card_pil, use_container_width=True)
             
             meta = cap['metadata']
             st.markdown(
                 f"<small style='color:#64748b;font-family:Courier New;'>"
                 f"{cap['timestamp']}<br>"
-                f"MODE:{meta['mode'].upper()} | PEAK:{meta['peak']:.0f}°<br>"
+                f"MODE:{meta['mode'].upper()} | PEAK:{meta['peak']:.0f}&deg;<br>"
                 f"B:{meta['brightness']:+.1f} C:{meta['contrast']:.1f} "
-                f"S:{meta['saturation']:.1f} γ:{meta['gamma']:.1f}"
-                f"</small>", unsafe_allow_html=True)
+                f"S:{meta['saturation']:.1f} &gamma;:{meta['gamma']:.1f}"
+                f"</small>",
+                unsafe_allow_html=True
+            )
             
             # Individual download button
             img_bytes = pil_to_bytes(card_pil)
-            st.markdown(get_image_download_link(
-                img_bytes, 
-                f"qcaus_{cap['timestamp'].replace(':','-').replace(' ','_')}.png",
-                "Download"
-            ), unsafe_allow_html=True)
+            safe_ts = cap['timestamp'].replace(':', '-').replace(' ', '_')
+            st.markdown(
+                get_image_download_link(
+                    img_bytes, 
+                    f"qcaus_{safe_ts}.png",
+                    "Download"
+                ),
+                unsafe_allow_html=True
+            )
             
             # View full-resolution original
             with st.expander("🔍 View original"):
                 frame_pil = frame_to_pil(cap['frame_bgr'])
                 st.image(frame_pil, use_container_width=True)
                 orig_bytes = pil_to_bytes(frame_pil)
-                st.markdown(get_image_download_link(
-                    orig_bytes,
-                    f"qcaus_original_{cap['timestamp'].replace(':','-').replace(' ','_')}.png",
-                    "Download original"
-                ), unsafe_allow_html=True)
+                st.markdown(
+                    get_image_download_link(
+                        orig_bytes,
+                        f"qcaus_original_{safe_ts}.png",
+                        "Download original"
+                    ),
+                    unsafe_allow_html=True
+                )
             
             st.markdown("</div>", unsafe_allow_html=True)
 
@@ -573,19 +598,21 @@ if st.session_state.show_gallery and len(st.session_state.captures) > 0:
 shortcut_js = """
 <script>
 document.addEventListener('keydown', function(e) {
-    // Only trigger if not typing in an input
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     
     switch(e.key.toLowerCase()) {
         case ' ':
             e.preventDefault();
-            // Click the first capture button
-            const capBtn = document.querySelector('button:has-text("CAPTURE FRAME")');
-            if (capBtn) capBtn.click();
+            const buttons = document.querySelectorAll('button');
+            for (let btn of buttons) {
+                if (btn.textContent.includes('CAPTURE FRAME')) {
+                    btn.click();
+                    break;
+                }
+            }
             break;
         case 'f':
             e.preventDefault();
-            // Toggle fullscreen
             if (!document.fullscreenElement) {
                 document.documentElement.requestFullscreen();
             } else {
@@ -594,15 +621,24 @@ document.addEventListener('keydown', function(e) {
             break;
         case 'd':
             e.preventDefault();
-            // Toggle darkroom checkbox
-            const darkCheckbox = document.querySelector('label:has-text("Darkroom") input[type="checkbox"]');
-            if (darkCheckbox) darkCheckbox.click();
+            const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+            for (let cb of checkboxes) {
+                const label = cb.parentElement?.textContent || '';
+                if (label.includes('Darkroom')) {
+                    cb.click();
+                    break;
+                }
+            }
             break;
         case 'g':
             e.preventDefault();
-            // Toggle gallery button
-            const galBtn = document.querySelector('button:has-text("GALLERY")');
-            if (galBtn) galBtn.click();
+            const allButtons = document.querySelectorAll('button');
+            for (let btn of allButtons) {
+                if (btn.textContent.includes('GALLERY')) {
+                    btn.click();
+                    break;
+                }
+            }
             break;
     }
 });
