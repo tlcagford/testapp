@@ -6,4 +6,6 @@ av>=10
 Pillow>=10
 matplotlib 
 reportlab 
-scipy
+pandas>=1.5.0
+plotly>=5.17.0
+scipy>=1.10.0
