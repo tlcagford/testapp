@@ -75,6 +75,8 @@ def load_settings(file) -> pd.DataFrame:
         if missing:
             st.error(f"Settings file missing required column(s): {missing}")
             return None
+        # Add run_key column for compatibility
+        df["run_key"] = df["run_id"].astype(str).str.lower()
         return df
     except Exception as e:
         st.error(f"Error loading settings: {str(e)}")
@@ -144,6 +146,7 @@ def generate_sample_data() -> tuple:
     events_df = pd.DataFrame(events_rows, columns=["timestamp_ns", "channel"])
     events_df = events_df.sort_values("timestamp_ns").reset_index(drop=True)
     settings_df = pd.DataFrame(settings_rows, columns=["run_id", "start_ns", "end_ns", "angle_a_deg", "angle_b_deg"])
+    settings_df["run_key"] = settings_df["run_id"].astype(str).str.lower()
     return events_df, settings_df, channel_map
 
 # ============================================================================
@@ -251,8 +254,10 @@ def correlation_E(coinc: CoincidenceResult, subtract_accidentals: bool = True) -
 def analyze_run(events: pd.DataFrame, settings: pd.DataFrame, channel_map: dict,
                  window_ns: float, subtract_accidentals: bool = True) -> dict:
     """Full CHSH analysis pipeline."""
+    # Ensure settings has run_key
     settings = settings.copy()
-    settings["run_key"] = settings["run_id"].astype(str).str.lower()
+    if "run_key" not in settings.columns:
+        settings["run_key"] = settings["run_id"].astype(str).str.lower()
     
     per_run = {}
     for _, row in settings.iterrows():
@@ -260,15 +265,25 @@ def analyze_run(events: pd.DataFrame, settings: pd.DataFrame, channel_map: dict,
         if key not in ["ab", "abp", "apb", "apbp"]:
             continue
         
-        coinc = analyze_coincidences(events, channel_map, window_ns,
-                                      start_ns=row["start_ns"], end_ns=row["end_ns"])
-        E, sigE, raw = correlation_E(coinc, subtract_accidentals)
-        
-        per_run[key] = {
-            "E": E, "sigma_E": sigE, "raw_counts": raw,
-            "angle_a_deg": row["angle_a_deg"], "angle_b_deg": row["angle_b_deg"],
-            "singles": coinc.singles, "duration_s": coinc.run_duration_s,
-        }
+        try:
+            coinc = analyze_coincidences(events, channel_map, window_ns,
+                                          start_ns=row["start_ns"], end_ns=row["end_ns"])
+            E, sigE, raw = correlation_E(coinc, subtract_accidentals)
+            
+            per_run[key] = {
+                "E": E, "sigma_E": sigE, "raw_counts": raw,
+                "angle_a_deg": row["angle_a_deg"], "angle_b_deg": row["angle_b_deg"],
+                "singles": coinc.singles, "duration_s": coinc.run_duration_s,
+            }
+        except Exception as e:
+            st.warning(f"Error analyzing run {key}: {str(e)}")
+            continue
+    
+    # Check if all required runs are present
+    required = ["ab", "abp", "apb", "apbp"]
+    missing = [r for r in required if r not in per_run]
+    if missing:
+        return {"error": f"Missing required runs: {missing}", "per_run": per_run, "chsh": None}
     
     S = per_run["ab"]["E"] - per_run["abp"]["E"] + per_run["apb"]["E"] + per_run["apbp"]["E"]
     sigma_S = np.sqrt(per_run["ab"]["sigma_E"]**2 + per_run["abp"]["sigma_E"]**2 + 
@@ -310,6 +325,9 @@ def bin_coincidences_by_time(events: pd.DataFrame, channel_map: dict,
     end_time = df["time_s"].max()
     
     bins = np.arange(start_time, end_time, bin_width_s)
+    if len(bins) < 2:
+        return pd.DataFrame()
+    
     bin_centers = bins[:-1] + bin_width_s/2
     
     results = []
@@ -335,6 +353,9 @@ def bin_coincidences_by_time(events: pd.DataFrame, channel_map: dict,
         return pd.DataFrame()
     
     df_results = pd.DataFrame(results)
+    if len(df_results) == 0:
+        return pd.DataFrame()
+    
     df_results = df_results.groupby("time_s").filter(
         lambda x: x["counts"].sum() >= min_coincidences
     )
@@ -347,16 +368,24 @@ def fit_oscillatory_modulation(times: np.ndarray, counts: np.ndarray,
     times = np.array(times)
     counts = np.array(counts)
     
+    if len(times) < 10:
+        return {"detected": False, "message": "Insufficient data points"}
+    
     counts_norm = counts / np.mean(counts)
     errors = np.sqrt(counts) / np.mean(counts)
     
     omega_min, omega_max = omega_range
+    if omega_min <= 0 or omega_max <= omega_min:
+        omega_min = 1e-6
+        omega_max = 10.0
+    
     omega_grid = np.logspace(np.log10(omega_min), np.log10(omega_max), n_frequencies)
     
     best_freq = None
     best_amplitude = None
     best_phase = None
     best_p_value = 1.0
+    best_chi2 = np.inf
     
     for omega in omega_grid:
         try:
@@ -383,14 +412,19 @@ def fit_oscillatory_modulation(times: np.ndarray, counts: np.ndarray,
                     best_amplitude = A
                     best_phase = phi
                     best_p_value = p_value
+                    best_chi2 = chi2_val
         except:
             continue
+    
+    if best_freq is None:
+        return {"detected": False, "message": "No fit converged"}
     
     return {
         "best_frequency_hz": best_freq/(2*np.pi) if best_freq else None,
         "best_amplitude": best_amplitude,
         "best_phase": best_phase,
         "p_value": best_p_value,
+        "chi2": best_chi2,
         "significance_sigma": norm.ppf(1 - best_p_value/2) if best_p_value > 0 else 0,
         "detected": best_freq is not None and best_p_value < 0.05
     }
@@ -403,9 +437,16 @@ def analyze_dark_matter(events: pd.DataFrame, settings: pd.DataFrame,
     if events is None or settings is None or channel_map is None:
         return {"error": "Data not loaded"}
     
+    # Ensure settings has run_key
+    settings = settings.copy()
+    if "run_key" not in settings.columns:
+        settings["run_key"] = settings["run_id"].astype(str).str.lower()
+    
     try:
         # Get base results
         base_result = analyze_run(events, settings, channel_map, window_ns)
+        if "error" in base_result:
+            return {"error": base_result["error"]}
         
         # Time-binned analysis
         time_series_data = {}
@@ -417,8 +458,12 @@ def analyze_dark_matter(events: pd.DataFrame, settings: pd.DataFrame,
             start_ns = row["start_ns"].values[0]
             end_ns = row["end_ns"].values[0]
             
+            # Use larger bin width for better statistics
+            duration_s = (end_ns - start_ns) * 1e-9
+            bin_width = max(1.0, duration_s / 20)  # At least 20 bins per run
+            
             binned = bin_coincidences_by_time(
-                events, channel_map, window_ns, 1.0,
+                events, channel_map, window_ns, bin_width,
                 start_ns=start_ns, end_ns=end_ns
             )
             
@@ -445,7 +490,7 @@ def analyze_dark_matter(events: pd.DataFrame, settings: pd.DataFrame,
                 times.append(time)
                 E_values.append(E)
             
-            if len(times) > 10:
+            if len(times) > 5:
                 time_series_data[run_key] = {
                     "times": np.array(times),
                     "E": np.array(E_values)
@@ -462,8 +507,15 @@ def analyze_dark_matter(events: pd.DataFrame, settings: pd.DataFrame,
                     all_E.extend(time_series_data[key]["E"])
             
             if len(all_times) > 20:
-                omega_min = 0.5 * epsilon * dm_mass_eV * C**2 / HBAR
-                omega_max = 2.0 * epsilon * dm_mass_eV * C**2 / HBAR
+                # Estimate frequency range from DM mass
+                omega_min = 0.1 * epsilon * dm_mass_eV * C**2 / HBAR
+                omega_max = 10.0 * epsilon * dm_mass_eV * C**2 / HBAR
+                
+                # Ensure reasonable range
+                if omega_min < 1e-6:
+                    omega_min = 1e-6
+                if omega_max > 1e6:
+                    omega_max = 1e6
                 
                 fit_result = fit_oscillatory_modulation(
                     np.array(all_times), np.array(all_E),
@@ -474,9 +526,9 @@ def analyze_dark_matter(events: pd.DataFrame, settings: pd.DataFrame,
                     "base_result": base_result,
                     "time_series": time_series_data,
                     "oscillation": fit_result,
-                    "omega_beat": fit_result["best_frequency_hz"] * 2 * np.pi if fit_result["best_frequency_hz"] else None,
-                    "coupling_strength": fit_result["best_amplitude"] / 2 if fit_result["best_amplitude"] else None,
-                    "detection_significance": fit_result["significance_sigma"]
+                    "omega_beat": fit_result["best_frequency_hz"] * 2 * np.pi if fit_result.get("best_frequency_hz") else None,
+                    "coupling_strength": fit_result.get("best_amplitude", 0) / 2 if fit_result.get("best_amplitude") else None,
+                    "detection_significance": fit_result.get("significance_sigma", 0)
                 }
         
         return {"base_result": base_result, "no_oscillation": True}
@@ -493,7 +545,6 @@ def convert_to_sidereal_time(timestamps_ns: np.ndarray,
     """Convert UTC timestamps to Local Sidereal Time."""
     timestamps_s = timestamps_ns / 1e-9
     # Simplified sidereal time calculation
-    # For a more accurate calculation, use astropy
     jd = timestamps_s / 86400.0 + 2440587.5  # Approximate JD
     gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0)
     gmst = gmst % 360
@@ -577,7 +628,7 @@ def analyze_sidereal(events: pd.DataFrame, channel_map: dict, window_ns: float,
 
 def create_chsh_plot(results):
     """Create CHSH visualization."""
-    if not results or "chsh" not in results:
+    if not results or "chsh" not in results or results["chsh"] is None:
         return None
     
     chsh = results["chsh"]
@@ -617,6 +668,8 @@ def create_correlation_plot(results):
     
     fig = go.Figure()
     for key in ["ab", "abp", "apb", "apbp"]:
+        if key not in results["per_run"]:
+            continue
         r = results["per_run"][key]
         fig.add_trace(go.Bar(
             name=key.upper(),
@@ -639,10 +692,10 @@ def create_correlation_plot(results):
 
 def create_dm_oscillation_plot(time_series, oscillation):
     """Create dark matter oscillation plot."""
-    fig = make_subplots(rows=2, cols=1,
-                        subplot_titles=("Sidereal Modulation", "Residuals"))
+    fig = go.Figure()
     
-    if not time_series or not oscillation:
+    if not time_series:
+        fig.update_layout(title="No time series data available", height=400)
         return fig
     
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
@@ -655,20 +708,20 @@ def create_dm_oscillation_plot(time_series, oscillation):
                     mode='markers+lines',
                     name=f"E({key})",
                     marker=dict(color=colors[i])
-                ),
-                row=1, col=1
+                )
             )
     
     # Add fitted oscillation
-    if oscillation.get("best_frequency_hz") is not None:
+    if oscillation and oscillation.get("best_frequency_hz") is not None:
         first_key = list(time_series.keys())[0]
         if first_key in time_series:
             t = np.linspace(time_series[first_key]['times'][0],
                            time_series[first_key]['times'][-1], 1000)
-            A = oscillation["best_amplitude"]
+            A = oscillation.get("best_amplitude", 0)
             omega = oscillation["best_frequency_hz"] * 2 * np.pi
-            phi = oscillation["best_phase"] or 0
-            y = 1 + A * np.cos(omega * t + phi)
+            phi = oscillation.get("best_phase", 0)
+            mean_E = np.mean([np.mean(data['E']) for data in time_series.values()])
+            y = mean_E + A * np.cos(omega * t + phi)
             
             fig.add_trace(
                 go.Scatter(
@@ -676,11 +729,16 @@ def create_dm_oscillation_plot(time_series, oscillation):
                     mode='lines',
                     name='Fitted Oscillation',
                     line=dict(color='red', dash='dash')
-                ),
-                row=1, col=1
+                )
             )
     
-    fig.update_layout(height=400, showlegend=True)
+    fig.update_layout(
+        title="Dark Matter Oscillation Analysis",
+        xaxis_title="Time (s)",
+        yaxis_title="E(a,b)",
+        height=400,
+        showlegend=True
+    )
     return fig
 
 
@@ -703,9 +761,9 @@ def create_sidereal_plot(sidereal_data):
     # Add fit if available
     if sidereal_data.get("detected"):
         hours = np.linspace(0, 24, 100)
-        E0 = sidereal_data["E0"]
-        A = sidereal_data["amplitude"]
-        phi = sidereal_data["phase"]
+        E0 = sidereal_data.get("E0", 0)
+        A = sidereal_data.get("amplitude", 0)
+        phi = sidereal_data.get("phase", 0)
         y_fit = E0 + A * np.cos(2*np.pi*hours/24 + phi)
         
         fig.add_trace(go.Scatter(
@@ -732,6 +790,8 @@ def create_coincidence_heatmap(results):
     
     data = []
     for key in ["ab", "abp", "apb", "apbp"]:
+        if key not in results["per_run"]:
+            continue
         r = results["per_run"][key]
         data.append({
             'Setting': key.upper(),
@@ -740,6 +800,9 @@ def create_coincidence_heatmap(results):
             'N+-': r['raw_counts']['N+-'],
             'N-+': r['raw_counts']['N-+']
         })
+    
+    if not data:
+        return None
     
     df = pd.DataFrame(data)
     df_matrix = df.set_index('Setting')[['N++', 'N--', 'N+-', 'N-+']]
@@ -758,7 +821,7 @@ def create_coincidence_heatmap(results):
 
 def create_confidence_plot(results):
     """Create confidence visualization."""
-    if not results or "chsh" not in results:
+    if not results or "chsh" not in results or results["chsh"] is None:
         return None
     
     sigma = results["chsh"]["sigma_above_classical"]
@@ -774,7 +837,7 @@ def create_confidence_plot(results):
         line=dict(color='gray', dash='dash')
     ))
     
-    fig.add_vline(x=sigma, line_dash="solid", line_color="red",
+    fig.add_vline(x=min(sigma, 3), line_dash="solid", line_color="red",
                   annotation_text=f"Measured: {sigma:.1f}σ")
     
     fig.add_vrect(x0=5, x1=10, fillcolor="green", opacity=0.2,
@@ -970,7 +1033,10 @@ with st.sidebar:
                             subtract_accidentals
                         )
                         st.session_state.analysis_results = results
-                        st.success("✅ Analysis complete!")
+                        if "error" in results:
+                            st.error(f"Analysis error: {results['error']}")
+                        else:
+                            st.success("✅ Analysis complete!")
                     except Exception as e:
                         st.error(f"Analysis failed: {str(e)}")
         
@@ -985,10 +1051,10 @@ with st.sidebar:
                             window_ns
                         )
                         st.session_state.dm_results = dm_results
-                        if "error" not in dm_results:
-                            st.success("✅ DM search complete!")
-                        else:
+                        if "error" in dm_results:
                             st.warning(f"DM search issue: {dm_results['error']}")
+                        else:
+                            st.success("✅ DM search complete!")
                     except Exception as e:
                         st.error(f"DM search failed: {str(e)}")
         
@@ -1035,10 +1101,9 @@ if st.session_state.events_df is not None:
             help="Total detection events"
         )
     with col2:
-        if st.session_state.analysis_results:
+        if st.session_state.analysis_results and "chsh" in st.session_state.analysis_results and st.session_state.analysis_results["chsh"] is not None:
             S = st.session_state.analysis_results["chsh"]["S"]
             sigma = st.session_state.analysis_results["chsh"]["sigma_above_classical"]
-            color = "green" if sigma > 5 else "orange" if sigma > 3 else "red"
             st.metric(
                 "🎯 S-Parameter",
                 f"{S:.4f}",
@@ -1046,7 +1111,7 @@ if st.session_state.events_df is not None:
                 delta_color="normal"
             )
     with col3:
-        if st.session_state.analysis_results:
+        if st.session_state.analysis_results and "chsh" in st.session_state.analysis_results and st.session_state.analysis_results["chsh"] is not None:
             sigma = st.session_state.analysis_results["chsh"]["sigma_above_classical"]
             st.metric(
                 "📈 Significance",
@@ -1055,7 +1120,7 @@ if st.session_state.events_df is not None:
             )
 
 # Results Tabs
-if st.session_state.analysis_results:
+if st.session_state.analysis_results and "chsh" in st.session_state.analysis_results and st.session_state.analysis_results["chsh"] is not None:
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📊 CHSH Results",
         "🔬 Dark Matter Search",
@@ -1074,7 +1139,6 @@ if st.session_state.analysis_results:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            violation = chsh["violates_classical_bound"]
             sigma = chsh["sigma_above_classical"]
             color = "strong" if sigma > 5 else "moderate" if sigma > 3 else "weak"
             status = "✅ Strong" if sigma > 5 else "⚠️ Moderate" if sigma > 3 else "❌ Weak"
@@ -1114,6 +1178,8 @@ if st.session_state.analysis_results:
         
         data = []
         for key in ["ab", "abp", "apb", "apbp"]:
+            if key not in results["per_run"]:
+                continue
             r = results["per_run"][key]
             data.append({
                 "Setting": key.upper(),
@@ -1125,7 +1191,8 @@ if st.session_state.analysis_results:
                 "Coincidences": r["raw_counts"]["total"]
             })
         
-        st.dataframe(pd.DataFrame(data), use_container_width=True)
+        if data:
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
         
         # Plots
         col1, col2 = st.columns(2)
@@ -1151,10 +1218,13 @@ if st.session_state.analysis_results:
                 st.info("No significant oscillation detected in the data")
                 
                 # Show base CHSH results
-                if "base_result" in dm:
+                if "base_result" in dm and "chsh" in dm["base_result"] and dm["base_result"]["chsh"] is not None:
                     base = dm["base_result"]
-                    st.metric("S-Parameter", f"{base['chsh']['S']:.4f}")
-                    st.metric("Significance", f"{base['chsh']['sigma_above_classical']:.2f} σ")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("S-Parameter", f"{base['chsh']['S']:.4f}")
+                    with col2:
+                        st.metric("Significance", f"{base['chsh']['sigma_above_classical']:.2f} σ")
             else:
                 col1, col2, col3 = st.columns(3)
                 
@@ -1164,11 +1234,11 @@ if st.session_state.analysis_results:
                         <h3>Oscillation Detection</h3>
                     """, unsafe_allow_html=True)
                     
-                    osc = dm["oscillation"]
+                    osc = dm.get("oscillation", {})
                     if osc.get("detected"):
                         st.success("✅ Modulation detected!")
-                        st.metric("Frequency", f"{osc['best_frequency_hz']:.6f} Hz")
-                        st.metric("Significance", f"{osc['significance_sigma']:.2f} σ")
+                        st.metric("Frequency", f"{osc.get('best_frequency_hz', 0):.6f} Hz")
+                        st.metric("Significance", f"{osc.get('significance_sigma', 0):.2f} σ")
                     else:
                         st.warning("❌ No significant modulation")
                 
@@ -1180,10 +1250,10 @@ if st.session_state.analysis_results:
                     
                     if dm.get("omega_beat"):
                         st.metric("ω_beat", f"{dm['omega_beat']:.4e} rad/s")
-                        st.metric("Coupling Strength", f"{dm['coupling_strength']:.4f}")
+                        st.metric("Coupling Strength", f"{dm.get('coupling_strength', 0):.4f}")
                         
                         # Estimate mass
-                        if dm["coupling_strength"]:
+                        if dm.get("coupling_strength", 0) > 0:
                             mass_est = dm["omega_beat"] * HBAR / (dm["coupling_strength"] * C**2)
                             st.metric("Mass Estimate", f"{mass_est:.2e} eV")
                 
@@ -1193,9 +1263,10 @@ if st.session_state.analysis_results:
                         <h3>Physics Interpretation</h3>
                     """, unsafe_allow_html=True)
                     
-                    if dm.get("detection_significance", 0) > 5:
+                    sig = dm.get("detection_significance", 0)
+                    if sig > 5:
                         st.success("🔬 Strong dark matter signal!")
-                    elif dm.get("detection_significance", 0) > 3:
+                    elif sig > 3:
                         st.warning("⚠️ Moderate dark matter evidence")
                     else:
                         st.info("No dark matter signal")
@@ -1230,8 +1301,8 @@ if st.session_state.analysis_results:
                     
                     if sidereal.get("detected"):
                         st.success("✅ Sidereal modulation detected!")
-                        st.metric("Amplitude", f"{sidereal['amplitude']:.4f}")
-                        st.metric("Significance", f"{sidereal['significance']:.2f} σ")
+                        st.metric("Amplitude", f"{sidereal.get('amplitude', 0):.4f}")
+                        st.metric("Significance", f"{sidereal.get('significance', 0):.2f} σ")
                     else:
                         st.warning("❌ No sidereal modulation detected")
                 
@@ -1242,8 +1313,8 @@ if st.session_state.analysis_results:
                     """, unsafe_allow_html=True)
                     
                     if sidereal.get("detected"):
-                        st.metric("E₀", f"{sidereal['E0']:.4f}")
-                        st.metric("Phase", f"{sidereal['phase']:.2f} rad")
+                        st.metric("E₀", f"{sidereal.get('E0', 0):.4f}")
+                        st.metric("Phase", f"{sidereal.get('phase', 0):.2f} rad")
                 
                 with col3:
                     st.markdown("""
@@ -1290,32 +1361,35 @@ if st.session_state.analysis_results:
         labels = []
         
         for key in ["ab", "abp", "apb", "apbp"]:
+            if key not in results["per_run"]:
+                continue
             r = results["per_run"][key]
             angles_a.append(r["angle_a_deg"])
             angles_b.append(r["angle_b_deg"])
             E_values.append(r["E"])
             labels.append(key.upper())
         
-        fig = go.Figure()
-        fig.add_trace(go.Scatter3d(
-            x=angles_a,
-            y=angles_b,
-            z=E_values,
-            mode='markers+text',
-            marker=dict(size=15, color=E_values, colorscale='Viridis'),
-            text=labels,
-            textposition="top center"
-        ))
-        
-        fig.update_layout(
-            scene=dict(
-                xaxis_title="Angle A (deg)",
-                yaxis_title="Angle B (deg)",
-                zaxis_title="E(a,b)"
-            ),
-            height=500
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if angles_a:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter3d(
+                x=angles_a,
+                y=angles_b,
+                z=E_values,
+                mode='markers+text',
+                marker=dict(size=15, color=E_values, colorscale='Viridis'),
+                text=labels,
+                textposition="top center"
+            ))
+            
+            fig.update_layout(
+                scene=dict(
+                    xaxis_title="Angle A (deg)",
+                    yaxis_title="Angle B (deg)",
+                    zaxis_title="E(a,b)"
+                ),
+                height=500
+            )
+            st.plotly_chart(fig, use_container_width=True)
     
     with tab5:
         st.markdown("## 📋 Full Analysis Report")
@@ -1340,6 +1414,8 @@ if st.session_state.analysis_results:
 """
         
         for key in ["ab", "abp", "apb", "apbp"]:
+            if key not in results["per_run"]:
+                continue
             r = results["per_run"][key]
             report += f"| {key.upper()} | {r['angle_a_deg']} | {r['angle_b_deg']} | {r['E']:+.4f} | {r['sigma_E']:.4f} | {r['duration_s']:.1f} | {r['raw_counts']['total']} |\n"
         
@@ -1353,9 +1429,9 @@ if st.session_state.analysis_results:
 ## Dark Matter Search Results
 
 - **Oscillation Detected**: Yes
-- **Frequency**: {osc['best_frequency_hz']:.6f} Hz
-- **Amplitude**: {osc['best_amplitude']:.4f}
-- **Significance**: {osc['significance_sigma']:.2f} σ
+- **Frequency**: {osc.get('best_frequency_hz', 0):.6f} Hz
+- **Amplitude**: {osc.get('best_amplitude', 0):.4f}
+- **Significance**: {osc.get('significance_sigma', 0):.2f} σ
 - **Coupling Strength**: {dm.get('coupling_strength', 'N/A')}
 """
         
@@ -1368,9 +1444,9 @@ if st.session_state.analysis_results:
 ## Sidereal Time Analysis
 
 - **Sidereal Modulation**: Detected
-- **Amplitude**: {sidereal['amplitude']:.4f} ± {sidereal['amplitude_error']:.4f}
-- **Significance**: {sidereal['significance']:.2f} σ
-- **Phase**: {sidereal['phase']:.2f} rad
+- **Amplitude**: {sidereal.get('amplitude', 0):.4f} ± {sidereal.get('amplitude_error', 0):.4f}
+- **Significance**: {sidereal.get('significance', 0):.2f} σ
+- **Phase**: {sidereal.get('phase', 0):.2f} rad
 """
         
         # Physics interpretation
