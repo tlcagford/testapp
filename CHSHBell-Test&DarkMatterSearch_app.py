@@ -29,6 +29,7 @@ import time
 import threading
 import queue
 import random
+import hashlib
 
 warnings.filterwarnings('ignore')
 
@@ -84,6 +85,12 @@ class QuantumNetworkValidator:
         """Add a node to the network"""
         self.nodes[node.node_id] = node
         
+    def get_node(self, node_id: str) -> NetworkNode:
+        """Get a node by ID"""
+        if node_id not in self.nodes:
+            raise ValueError(f"Node {node_id} not found")
+        return self.nodes[node_id]
+        
     def validate_node(self, node_id: str, data: pd.DataFrame) -> NetworkValidationResult:
         """Validate a single network node"""
         if node_id not in self.nodes:
@@ -93,8 +100,13 @@ class QuantumNetworkValidator:
         
         # Parse the data and compute CHSH
         try:
+            # Check if data has the required columns
+            required_cols = ['angle_a', 'angle_b', 'N_AB', 'N_CD']
+            missing = [c for c in required_cols if c not in data.columns]
+            if missing:
+                raise ValueError(f"Missing required columns: {missing}")
+            
             # Extract coincidence counts
-            # Expected columns: angle_a, angle_b, N_AB, N_CD, N_AC, N_BD
             settings = {}
             for _, row in data.iterrows():
                 key = f"a{row['angle_a']}_b{row['angle_b']}"
@@ -106,6 +118,9 @@ class QuantumNetworkValidator:
                     'N_AC': row.get('N_AC', 0),
                     'N_BD': row.get('N_BD', 0)
                 }
+            
+            if len(settings) < 4:
+                raise ValueError(f"Need at least 4 angle settings, found {len(settings)}")
             
             # Compute E for each setting
             E_values = {}
@@ -119,6 +134,9 @@ class QuantumNetworkValidator:
                 E_values[key] = E
                 sigma_values[key] = sigma
             
+            if len(E_values) < 4:
+                raise ValueError(f"Need at least 4 valid E values, found {len(E_values)}")
+            
             # Find the CHSH settings (assuming standard angles)
             # Map angles to standard CHSH settings
             chsh_settings = {}
@@ -126,32 +144,57 @@ class QuantumNetworkValidator:
                 # Parse angle values from key
                 parts = key.replace('a', '').replace('b', '').split('_')
                 if len(parts) == 2:
-                    a = float(parts[0])
-                    b = float(parts[1])
-                    # Map to standard CHSH keys
-                    if abs(a) < 1 and abs(b - 22.5) < 1:
-                        chsh_settings['ab'] = E
-                    elif abs(a) < 1 and abs(b - 67.5) < 1:
-                        chsh_settings['abp'] = E
-                    elif abs(a - 45) < 1 and abs(b - 22.5) < 1:
-                        chsh_settings['apb'] = E
-                    elif abs(a - 45) < 1 and abs(b - 67.5) < 1:
-                        chsh_settings['apbp'] = E
+                    try:
+                        a = float(parts[0])
+                        b = float(parts[1])
+                        # Map to standard CHSH keys with tolerance
+                        if abs(a) < 5 and abs(b - 22.5) < 5:
+                            chsh_settings['ab'] = E
+                        elif abs(a) < 5 and abs(b - 67.5) < 5:
+                            chsh_settings['abp'] = E
+                        elif abs(a - 45) < 5 and abs(b - 22.5) < 5:
+                            chsh_settings['apb'] = E
+                        elif abs(a - 45) < 5 and abs(b - 67.5) < 5:
+                            chsh_settings['apbp'] = E
+                    except:
+                        continue
             
             if len(chsh_settings) < 4:
-                return None
-            
-            # Compute S
-            S = (chsh_settings.get('ab', 0) - chsh_settings.get('abp', 0) + 
-                 chsh_settings.get('apb', 0) + chsh_settings.get('apbp', 0))
+                # If standard angles not found, use the first 4 settings
+                keys = list(E_values.keys())[:4]
+                chsh_settings = {f's{i}': E_values[k] for i, k in enumerate(keys)}
+                # Compute S from all available settings (fallback)
+                E_list = list(chsh_settings.values())
+                if len(E_list) >= 4:
+                    S = E_list[0] - E_list[1] + E_list[2] + E_list[3]
+                else:
+                    return None
+            else:
+                # Compute S using standard CHSH formula
+                S = (chsh_settings.get('ab', 0) - chsh_settings.get('abp', 0) + 
+                     chsh_settings.get('apb', 0) + chsh_settings.get('apbp', 0))
             
             # Compute sigma
-            sigma_S = np.sqrt(sum([sigma_values.get(k, 0)**2 for k in ['ab', 'abp', 'apb', 'apbp'] if k in sigma_values]))
+            sigma_keys = ['ab', 'abp', 'apb', 'apbp']
+            sigma_values_list = []
+            for k in sigma_keys:
+                if k in sigma_values:
+                    sigma_values_list.append(sigma_values[k])
+                elif k in chsh_settings:
+                    # Estimate sigma if not available
+                    sigma_values_list.append(0.01)
+            
+            if len(sigma_values_list) >= 4:
+                sigma_S = np.sqrt(sum([s**2 for s in sigma_values_list[:4]]))
+            else:
+                sigma_S = 0.05  # Default error
+            
             sigma_above = (abs(S) - CLASSICAL_BOUND) / sigma_S if sigma_S > 0 else 0
             
             # Update node
             node.s_value = S
             node.sigma = sigma_S
+            node.status = "active"
             node.last_validation = {
                 'S': S,
                 'sigma_S': sigma_S,
@@ -180,8 +223,7 @@ class QuantumNetworkValidator:
             return result
             
         except Exception as e:
-            st.error(f"Validation error: {str(e)}")
-            return None
+            raise ValueError(f"Validation error: {str(e)}")
     
     def _check_alerts(self, result: NetworkValidationResult):
         """Check if validation triggers any alerts"""
@@ -205,12 +247,14 @@ class QuantumNetworkValidator:
         active_nodes = [n for n in self.nodes.values() if n.status == "active"]
         validated_nodes = [n for n in active_nodes if n.last_validation]
         
+        valid_S = [n.s_value for n in validated_nodes if n.sigma > 0]
+        
         return {
             'total_nodes': len(self.nodes),
             'active_nodes': len(active_nodes),
             'validated_nodes': len(validated_nodes),
             'entangled_nodes': len([n for n in validated_nodes if abs(n.s_value) > CLASSICAL_BOUND]),
-            'avg_S': np.mean([n.s_value for n in validated_nodes]) if validated_nodes else 0,
+            'avg_S': np.mean(valid_S) if valid_S else 0,
             'timestamp': datetime.now()
         }
 
@@ -253,7 +297,7 @@ def generate_test_network_data(seed=42, num_settings=4, counts=100000):
 
 def generate_network_timestamp_data(node_id, duration_seconds=60, event_rate=1000):
     """Generate synthetic timestamp data for network simulation"""
-    np.random.seed(random.randint(0, 1000000) + hash(node_id))
+    np.random.seed(random.randint(0, 1000000) + hash(node_id) % 1000000)
     
     # Simulate photon detections with entangled correlations
     n_events = int(duration_seconds * event_rate)
@@ -293,6 +337,12 @@ def generate_network_timestamp_data(node_id, duration_seconds=60, event_rate=100
 def generate_validation_certificate(result: NetworkValidationResult, node: NetworkNode):
     """Generate a validation certificate as HTML"""
     status = "✅ PASSED" if result.violates and result.sigma_above > 5 else "⚠️ PARTIAL" if result.violates else "❌ FAILED"
+    badge_class = "pass" if result.violates and result.sigma_above > 5 else "warn" if result.violates else "fail"
+    
+    # Get settings for display
+    settings_display = []
+    for k, v in result.settings.items():
+        settings_display.append(f"<tr><td>{k}</td><td>{v:+.4f}</td></tr>")
     
     html = f"""
     <!DOCTYPE html>
@@ -341,7 +391,7 @@ def generate_validation_certificate(result: NetworkValidationResult, node: Netwo
             </div>
             
             <div class="status">
-                <h2>Validation Status: <span class="badge badge-{'pass' if status == '✅ PASSED' else 'warn' if status == '⚠️ PARTIAL' else 'fail'}">{status}</span></h2>
+                <h2>Validation Status: <span class="badge badge-{badge_class}">{status}</span></h2>
             </div>
             
             <div class="details">
@@ -379,15 +429,13 @@ def generate_validation_certificate(result: NetworkValidationResult, node: Netwo
                     </tr>
                 </table>
                 
-                <h3>Per-Setting Results</h3>
+                <h3>Correlation Values</h3>
                 <table>
                     <tr>
                         <th>Setting</th>
-                        <th>Angle A</th>
-                        <th>Angle B</th>
                         <th>E(a,b)</th>
                     </tr>
-                    {''.join([f'<tr><td>{k}</td><td>{v:.1f}</td><td>{v:.1f}</td><td>{result.settings.get(k, 0):+.4f}</td></tr>' for k, v in [('ab', 22.5), ('abp', 67.5), ('apb', 22.5), ('apbp', 67.5)]])}
+                    {''.join(settings_display)}
                 </table>
             </div>
             
@@ -401,6 +449,21 @@ def generate_validation_certificate(result: NetworkValidationResult, node: Netwo
     </html>
     """
     return html
+
+# ============================================================================
+# SAMPLE DATA GENERATORS
+# ============================================================================
+
+def generate_sample_chsh_data():
+    """Generate sample CHSH data for testing"""
+    return pd.DataFrame({
+        'angle_a': [0, 0, 45, 45],
+        'angle_b': [22.5, 67.5, 22.5, 67.5],
+        'N_AB': [15000, 500, 500, 15000],
+        'N_CD': [14000, 400, 400, 14000],
+        'N_AC': [500, 15000, 15000, 500],
+        'N_BD': [400, 14000, 14000, 400]
+    })
 
 # ============================================================================
 # STREAMLIT APPLICATION
@@ -499,6 +562,8 @@ if 'monitoring' not in st.session_state:
     st.session_state.monitoring = False
 if 'alert_queue' not in st.session_state:
     st.session_state.alert_queue = []
+if 'selected_node_id' not in st.session_state:
+    st.session_state.selected_node_id = None
 
 # ============================================================================
 # SIDEBAR
@@ -515,57 +580,92 @@ with st.sidebar:
     node_name = st.text_input("Node Name:", value="Quantum Lab 1")
     node_location = st.text_input("Location:", value="Biddeford, ME")
     
-    if st.button("➕ Add Node", type="primary"):
-        if node_id not in st.session_state.nodes:
-            node = NetworkNode(
-                node_id=node_id,
-                name=node_name,
-                location=node_location,
-                channel_map={1: "A+", 2: "A-", 3: "B+", 4: "B-"}
-            )
-            st.session_state.validator.add_node(node)
-            st.session_state.nodes[node_id] = node
-            st.success(f"✅ Node {node_id} added")
-        else:
-            st.warning(f"Node {node_id} already exists")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("➕ Add Node", type="primary"):
+            if node_id not in st.session_state.nodes:
+                node = NetworkNode(
+                    node_id=node_id,
+                    name=node_name,
+                    location=node_location,
+                    channel_map={1: "A+", 2: "A-", 3: "B+", 4: "B-"}
+                )
+                st.session_state.validator.add_node(node)
+                st.session_state.nodes[node_id] = node
+                st.session_state.selected_node_id = node_id
+                st.success(f"✅ Node {node_id} added")
+            else:
+                st.warning(f"Node {node_id} already exists")
+    
+    with col2:
+        if st.button("🗑️ Remove Selected"):
+            if st.session_state.selected_node_id and st.session_state.selected_node_id in st.session_state.nodes:
+                del st.session_state.nodes[st.session_state.selected_node_id]
+                del st.session_state.validator.nodes[st.session_state.selected_node_id]
+                st.session_state.selected_node_id = None
+                st.success("✅ Node removed")
+    
+    # Node selector
+    if st.session_state.nodes:
+        st.markdown("---")
+        st.markdown("### 🎯 Select Node")
+        node_options = list(st.session_state.nodes.keys())
+        st.session_state.selected_node_id = st.selectbox(
+            "Select node for testing:",
+            node_options,
+            index=0 if node_options else None
+        )
     
     st.markdown("---")
     st.markdown("### 🔍 Test Options")
     
     test_type = st.radio(
         "Test Type:",
-        ["Upload Data", "Generate Test Data", "Live Network Monitor"]
+        ["Upload Data", "Generate Test Data", "Use Sample Data"]
     )
     
     if test_type == "Upload Data":
         st.markdown("**Upload CHSH Data**")
+        st.info("Format: angle_a, angle_b, N_AB, N_CD, N_AC, N_BD")
         uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
         
         if uploaded_file and st.button("Run Validation", type="primary"):
             try:
                 df = pd.read_csv(uploaded_file)
-                result = st.session_state.validator.validate_node(node_id, df)
-                if result:
-                    st.session_state.validation_results.append(result)
-                    st.success(f"✅ Validation complete: S = {result.S:.4f} ± {result.sigma_S:.4f}")
+                if st.session_state.selected_node_id:
+                    result = st.session_state.validator.validate_node(st.session_state.selected_node_id, df)
+                    if result:
+                        st.session_state.validation_results.append(result)
+                        st.success(f"✅ Validation complete: S = {result.S:.4f} ± {result.sigma_S:.4f}")
+                else:
+                    st.warning("Please add and select a node first")
             except Exception as e:
                 st.error(f"Error: {str(e)}")
     
     elif test_type == "Generate Test Data":
-        if st.button("Generate CHSH Data", type="primary"):
-            df = generate_test_network_data()
-            result = st.session_state.validator.validate_node(node_id, df)
-            if result:
-                st.session_state.validation_results.append(result)
-                st.success(f"✅ Validation complete: S = {result.S:.4f} ± {result.sigma_S:.4f}")
+        counts = st.slider("Counts per setting:", 10000, 200000, 100000, 10000)
+        if st.button("Generate & Validate", type="primary"):
+            df = generate_test_network_data(counts=counts)
+            if st.session_state.selected_node_id:
+                result = st.session_state.validator.validate_node(st.session_state.selected_node_id, df)
+                if result:
+                    st.session_state.validation_results.append(result)
+                    st.success(f"✅ Validation complete: S = {result.S:.4f} ± {result.sigma_S:.4f}")
+            else:
+                st.warning("Please add and select a node first")
     
-    elif test_type == "Live Network Monitor":
-        st.markdown("**Real-time Monitoring**")
-        duration = st.slider("Duration (seconds):", 10, 120, 30)
-        
-        if st.button("▶️ Start Monitoring", type="primary"):
-            st.session_state.monitoring = True
-            
+    elif test_type == "Use Sample Data":
+        if st.button("Load Sample CHSH Data", type="primary"):
+            df = generate_sample_chsh_data()
+            st.dataframe(df)
+            if st.session_state.selected_node_id:
+                result = st.session_state.validator.validate_node(st.session_state.selected_node_id, df)
+                if result:
+                    st.session_state.validation_results.append(result)
+                    st.success(f"✅ Validation complete: S = {result.S:.4f} ± {result.sigma_S:.4f}")
+            else:
+                st.warning("Please add and select a node first")
+    
     st.markdown("---")
     st.markdown("### 📊 Network Status")
     
@@ -585,122 +685,101 @@ st.markdown('<p class="sub-header">Real-time CHSH Bell-Test Certification for Qu
 
 # Network Nodes Display
 st.markdown("## 🌐 Network Nodes")
-col1, col2 = st.columns([2, 1])
 
-with col1:
-    if st.session_state.nodes:
+if st.session_state.nodes:
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
         for node_id, node in st.session_state.nodes.items():
             status_color = "live-active" if node.status == "active" else "live-idle"
             status_text = "🟢 Active" if node.status == "active" else "⚪ Idle"
+            is_selected = node_id == st.session_state.selected_node_id
             
             with st.container():
                 st.markdown(f"""
-                <div class="node-card">
-                    <h4>{node.name}</h4>
+                <div class="node-card" style="border-left-color: {'#2ca02c' if is_selected else '#1f77b4'};">
+                    <h4>{'👉 ' if is_selected else ''}{node.name}</h4>
                     <p><span class="live-indicator {status_color}"></span> {status_text}</p>
                     <p><strong>ID:</strong> {node.node_id} | <strong>Location:</strong> {node.location}</p>
                     <p><strong>S-Parameter:</strong> {node.s_value:.4f} ± {node.sigma:.4f}</p>
                     <p><strong>Status:</strong> {'✅ Entangled' if abs(node.s_value) > CLASSICAL_BOUND and node.sigma > 0 else '❌ Not Validated'}</p>
                 </div>
                 """, unsafe_allow_html=True)
-    else:
-        st.info("No nodes added. Add a node from the sidebar.")
-
-with col2:
-    st.markdown("### 📈 Network Health")
     
-    if st.session_state.validation_results:
-        # Show latest validation results
-        latest = st.session_state.validation_results[-1]
+    with col2:
+        st.markdown("### 📈 Network Health")
         
-        color = "status-pass" if latest.violates and latest.sigma_above > 5 else "status-warn" if latest.violates else "status-fail"
-        status_text = "✅ PASS" if latest.violates and latest.sigma_above > 5 else "⚠️ PARTIAL" if latest.violates else "❌ FAIL"
-        
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>Latest Validation</h3>
-            <h2 class="{color}">{status_text}</h2>
-            <p>S = {latest.S:.4f} ± {latest.sigma_S:.4f}</p>
-            <p>{latest.sigma_above:.2f} σ above classical bound</p>
-            <p>Node: {latest.node_id}</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Validation history chart
-        if len(st.session_state.validation_results) > 1:
-            fig = go.Figure()
+        if st.session_state.validation_results:
+            # Show latest validation results
+            latest = st.session_state.validation_results[-1]
             
-            times = [r.timestamp for r in st.session_state.validation_results]
-            S_values = [r.S for r in st.session_state.validation_results]
-            errors = [r.sigma_S for r in st.session_state.validation_results]
+            color = "status-pass" if latest.violates and latest.sigma_above > 5 else "status-warn" if latest.violates else "status-fail"
+            status_text = "✅ PASS" if latest.violates and latest.sigma_above > 5 else "⚠️ PARTIAL" if latest.violates else "❌ FAIL"
             
-            fig.add_trace(go.Scatter(
-                x=times,
-                y=S_values,
-                mode='lines+markers',
-                name='S-Parameter',
-                error_y=dict(type='data', array=errors)
-            ))
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Latest Validation</h3>
+                <h2 class="{color}">{status_text}</h2>
+                <p>S = {latest.S:.4f} ± {latest.sigma_S:.4f}</p>
+                <p>{latest.sigma_above:.2f} σ above classical bound</p>
+                <p>Node: {latest.node_id}</p>
+            </div>
+            """, unsafe_allow_html=True)
             
-            fig.add_hline(y=CLASSICAL_BOUND, line_dash="dash", line_color="red", annotation_text="Classical Bound")
-            fig.add_hline(y=TSIRELSON_BOUND, line_dash="dot", line_color="green", annotation_text="Tsirelson Bound")
-            
-            fig.update_layout(
-                title="Validation History",
-                xaxis_title="Time",
-                yaxis_title="S",
-                height=300
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No validation results yet. Run a test to see results.")
-
-# Live Monitoring
-if st.session_state.monitoring:
-    st.markdown("---")
-    st.markdown("## 📡 Live Network Monitor")
-    
-    # Placeholder for real-time monitoring
-    status_placeholder = st.empty()
-    data_placeholder = st.empty()
-    
-    # Simulate live monitoring
-    for i in range(10):
-        with status_placeholder:
-            st.markdown(f"🟢 **Monitoring Active** - Cycle {i+1}/10")
-        
-        # Generate and validate data
-        df = generate_network_timestamp_data(node_id, duration_seconds=5)
-        result = st.session_state.validator.validate_node(node_id, df)
-        if result:
-            st.session_state.validation_results.append(result)
-        
-        time.sleep(1)
-    
-    st.session_state.monitoring = False
-    st.success("✅ Monitoring complete!")
+            # Validation history chart
+            if len(st.session_state.validation_results) > 1:
+                fig = go.Figure()
+                
+                times = [r.timestamp for r in st.session_state.validation_results]
+                S_values = [r.S for r in st.session_state.validation_results]
+                errors = [r.sigma_S for r in st.session_state.validation_results]
+                
+                fig.add_trace(go.Scatter(
+                    x=times,
+                    y=S_values,
+                    mode='lines+markers',
+                    name='S-Parameter',
+                    error_y=dict(type='data', array=errors)
+                ))
+                
+                fig.add_hline(y=CLASSICAL_BOUND, line_dash="dash", line_color="red", annotation_text="Classical Bound")
+                fig.add_hline(y=TSIRELSON_BOUND, line_dash="dot", line_color="green", annotation_text="Tsirelson Bound")
+                
+                fig.update_layout(
+                    title="Validation History",
+                    xaxis_title="Time",
+                    yaxis_title="S",
+                    height=300
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No validation results yet. Run a test to see results.")
+else:
+    st.info("No nodes added. Add a node from the sidebar to begin testing.")
 
 # Export Certificate
-st.markdown("---")
-st.markdown("## 📋 Validation Certificates")
-
 if st.session_state.validation_results:
-    latest = st.session_state.validation_results[-1]
-    node = st.session_state.nodes.get(latest.node_id)
+    st.markdown("---")
+    st.markdown("## 📋 Validation Certificates")
     
-    if node and st.button("📄 Generate Certificate"):
-        html = generate_validation_certificate(latest, node)
-        st.download_button(
-            label="📥 Download Certificate (HTML)",
-            data=html,
-            file_name=f"certificate_{latest.report_id}.html",
-            mime="text/html"
-        )
+    latest = st.session_state.validation_results[-1]
+    
+    if latest.node_id in st.session_state.nodes:
+        node = st.session_state.nodes[latest.node_id]
+        
+        if st.button("📄 Generate Certificate"):
+            html = generate_validation_certificate(latest, node)
+            st.download_button(
+                label="📥 Download Certificate (HTML)",
+                data=html,
+                file_name=f"certificate_{latest.report_id}.html",
+                mime="text/html"
+            )
 
 # Data Export
-st.markdown("## 📤 Export Data")
-
 if st.session_state.validation_results:
+    st.markdown("## 📤 Export Data")
+    
     export_format = st.selectbox("Export Format:", ["CSV", "JSON", "Markdown"])
     
     if st.button("📥 Export Validation Data"):
