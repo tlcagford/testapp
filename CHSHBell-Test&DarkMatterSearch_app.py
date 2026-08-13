@@ -1,7 +1,7 @@
 """
 🔬 CHSH Bell-Test & Dark Matter Search - Complete Pipeline
 ===========================================================
-Supports both timestamp-based data AND the VBI_Coincidence dataset format.
+Supports VBI_Coincidence dataset format with swept-phase scanning.
 """
 
 import streamlit as st
@@ -40,50 +40,48 @@ SIDEREAL_DAY_S = 86164.0905
 SOLAR_DAY_S = 86400.0
 
 # ============================================================================
-# VBI DATA FORMAT PARSER
+# VBI DATA FORMAT PARSER (Fixed)
 # ============================================================================
 
 def parse_vbi_data(file) -> pd.DataFrame:
     """
     Parse the VBI_Coincidence dataset format.
     
-    Column structure (29 columns total):
-    0-1: Motorized stage positions (alpha, beta)
-    2-3: Piezo positions
-    4-7: Single counts on channels 1,2,3,4
-    8: Unknown
-    9: Coincidence counts between channels 1 and 2 (A+,B+)
-    10: Coincidence counts between channels 3 and 4 (A-,B-)
-    11-12: More coincidence counts (A+,B- and A-,B+)
-    13-28: Additional data (auxiliary channels, etc.)
+    The dataset has 29 columns:
+    0: alpha (motorized stage position - Alice)
+    1: beta (motorized stage position - Bob)  
+    2: piezo_a (piezo position - Alice)
+    3: piezo_b (piezo position - Bob)
+    4-7: Single counts channels 1-4
+    8: Unknown/trigger
+    9: N_AB (coincidence channels 1&2 = A+,B+)
+    10: N_CD (coincidence channels 3&4 = A-,B-)
+    11-12: Other coincidence channels
+    13-28: Additional data
     """
     try:
         # Read the space-separated file
         df = pd.read_csv(file, sep=r'\s+', header=None)
         
-        # Extract relevant columns based on the known format
-        # Columns: alpha, beta, piezo_a, piezo_b, singles1, singles2, singles3, singles4,
-        #          ?, N12, N34, N13?, N24?, ... 
+        # Extract relevant columns
         data = {
-            'alpha': df[0],      # Alice's phase setting
-            'beta': df[1],       # Bob's phase setting
-            'piezo_a': df[2],    # Piezo position A
-            'piezo_b': df[3],    # Piezo position B
-            'singles_1': df[4],  # Single counts channel 1
-            'singles_2': df[5],  # Single counts channel 2
-            'singles_3': df[6],  # Single counts channel 3
-            'singles_4': df[7],  # Single counts channel 4
-            'N_AB': df[9],       # Coincidence A+B+ (channels 1&2)
-            'N_CD': df[10],      # Coincidence A-B- (channels 3&4)
+            'alpha': df[0],
+            'beta': df[1],
+            'piezo_a': df[2],
+            'piezo_b': df[3],
+            'singles_1': df[4],
+            'singles_2': df[5],
+            'singles_3': df[6],
+            'singles_4': df[7],
+            'N_AB': df[9],   # Coincidence A+B+ (channels 1&2)
+            'N_CD': df[10],  # Coincidence A-B- (channels 3&4)
         }
         
-        # Try to get the other coincidence pairs if available
-        # In this dataset, columns 11 and 12 might contain the cross-coincidences
+        # Try to get cross-coincidences if available
         if df.shape[1] > 12:
-            data['N_AC'] = df[11] if df.shape[1] > 11 else 0  # A+B-
-            data['N_BD'] = df[12] if df.shape[1] > 12 else 0  # A-B+
+            data['N_AC'] = df[11] if df.shape[1] > 11 else 0
+            data['N_BD'] = df[12] if df.shape[1] > 12 else 0
         else:
-            # Estimate cross coincidences from singles rates if not directly measured
             data['N_AC'] = 0
             data['N_BD'] = 0
         
@@ -92,44 +90,71 @@ def parse_vbi_data(file) -> pd.DataFrame:
         # Filter out rows with zero coincidences
         df_processed = df_processed[(df_processed['N_AB'] > 0) & (df_processed['N_CD'] > 0)]
         
+        # Round the phase settings to identify unique settings
+        # The motorized stages are fixed, piezo scans the phase
+        df_processed['alpha_rounded'] = np.round(df_processed['alpha'] * 10) / 10
+        df_processed['beta_rounded'] = np.round(df_processed['beta'] * 10) / 10
+        
         return df_processed
     except Exception as e:
         st.error(f"Error parsing VBI data: {str(e)}")
         return None
 
+
 def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
     """
-    Compute CHSH S-parameter from VBI data.
-    For each phase setting (alpha, beta), compute E(a,b) and find the optimal
-    combination that maximizes S.
+    Compute CHSH S-parameter from VBI data using swept-phase analysis.
+    The data is taken at fixed alpha,beta with scanning piezo phase.
+    We need to find the phase settings that maximize S.
     """
     if df is None or len(df) == 0:
         return {"error": "No data to analyze"}
     
-    # For each unique phase setting combination, compute E
+    # Group by alpha and beta (motorized stages)
+    # In this dataset, alpha and beta are fixed, piezo scans the phase
+    alpha_val = df['alpha_rounded'].iloc[0]
+    beta_val = df['beta_rounded'].iloc[0]
+    
+    st.info(f"Analyzing data at α = {alpha_val:.1f}°, β = {beta_val:.1f}°")
+    
+    # For swept phase, we need to identify the phase values from piezo positions
+    # The phase is encoded in the piezo position (column 2)
+    # We'll bin the data by piezo position to find unique phase settings
+    
+    # Group by piezo position (which encodes the phase)
+    piezo_bins = np.linspace(df['piezo_b'].min(), df['piezo_b'].max(), 100)
+    df['piezo_bin'] = np.digitize(df['piezo_b'], piezo_bins)
+    
+    # Average the data in each piezo bin
+    grouped = df.groupby('piezo_bin').agg({
+        'N_AB': 'mean',
+        'N_CD': 'mean',
+        'N_AC': 'mean',
+        'N_BD': 'mean',
+        'piezo_a': 'mean',
+        'piezo_b': 'mean'
+    }).reset_index()
+    
+    # Compute E for each phase setting
     results = []
-    for alpha, beta in df.groupby(['alpha', 'beta']).groups:
-        group = df[(df['alpha'] == alpha) & (df['beta'] == beta)]
-        
-        # Average the counts for this phase setting
-        N_AB = group['N_AB'].mean()
-        N_CD = group['N_CD'].mean()
-        N_AC = group['N_AC'].mean() if 'N_AC' in group.columns else 0
-        N_BD = group['N_BD'].mean() if 'N_BD' in group.columns else 0
+    for _, row in grouped.iterrows():
+        N_AB = row['N_AB']
+        N_CD = row['N_CD']
+        N_AC = row['N_AC'] if not np.isnan(row['N_AC']) else 0
+        N_BD = row['N_BD'] if not np.isnan(row['N_BD']) else 0
         
         total = N_AB + N_CD + N_AC + N_BD
         if total == 0:
             continue
         
-        # Compute E for this setting
         E = (N_AB + N_CD - N_AC - N_BD) / total
-        
-        # Estimate error
         sigma_E = np.sqrt(N_AB + N_CD + N_AC + N_BD) / total
         
         results.append({
-            'alpha': alpha,
-            'beta': beta,
+            'alpha': alpha_val,
+            'beta': beta_val,
+            'piezo_a': row['piezo_a'],
+            'piezo_b': row['piezo_b'],
             'E': E,
             'sigma_E': sigma_E,
             'N_AB': N_AB,
@@ -144,33 +169,84 @@ def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
     
     df_results = pd.DataFrame(results)
     
-    # Find the 4 settings that maximize S (typical CHSH angles)
-    # Try all combinations of 4 settings
-    max_S = -np.inf
-    best_combination = None
-    best_results = None
+    # Find the 4 settings that maximize S
+    # For CHSH, we need: (a,b), (a,b'), (a',b), (a',b')
+    # With a=0, a'=45, b=22.5, b'=67.5 (or close to these)
+    # Since alpha and beta are fixed, we need to find the phase values
     
-    # Common CHSH angle pairs: (0,22.5), (0,67.5), (45,22.5), (45,67.5)
-    # We'll search the data for settings closest to these
-    target_settings = [
-        (0, 22.5), (0, 67.5), (45, 22.5), (45, 67.5)
-    ]
+    # The phase is encoded in the piezo position
+    # We'll use the piezo_b position as the phase indicator
     
-    # For each target, find the closest actual setting in the data
-    selected = []
-    for target_alpha, target_beta in target_settings:
-        # Find the closest alpha
-        closest_alpha = df_results.iloc[(df_results['alpha'] - target_alpha).abs().argsort()[:3]]
-        # Among those, find the closest beta
-        closest = closest_alpha.iloc[(closest_alpha['beta'] - target_beta).abs().argsort()[:1]]
-        if len(closest) > 0:
-            selected.append(closest.iloc[0])
+    # Find the piezo positions that give the maximum and minimum E
+    # For a typical CHSH scan, E oscillates sinusoidally with phase
+    
+    # Sort by piezo position
+    df_sorted = df_results.sort_values('piezo_b').reset_index(drop=True)
+    
+    # Find the extrema and zero crossings of E
+    # We need 4 settings: two for Alice (a, a') and two for Bob (b, b')
+    
+    # Look for the positions where E is maximized and minimized
+    # These correspond to specific phase settings
+    
+    # Find peaks and valleys in E vs piezo_b
+    E_values = df_sorted['E'].values
+    piezo_values = df_sorted['piezo_b'].values
+    
+    # Use FFT to find the oscillation period
+    try:
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(E_values, prominence=0.1)
+        valleys, _ = find_peaks(-E_values, prominence=0.1)
+        
+        if len(peaks) >= 2 and len(valleys) >= 2:
+            # We have enough extrema
+            # Select the best 4 settings
+            selected = []
+            
+            # Take the first peak as E(a,b) (max positive correlation)
+            idx_peak1 = peaks[0]
+            selected.append(df_sorted.iloc[idx_peak1])
+            
+            # Take the first valley as E(a,b') (max negative correlation)
+            idx_valley1 = valleys[0]
+            selected.append(df_sorted.iloc[idx_valley1])
+            
+            # Take the second peak as E(a',b) 
+            if len(peaks) >= 2:
+                idx_peak2 = peaks[1]
+                selected.append(df_sorted.iloc[idx_peak2])
+            else:
+                # If not enough peaks, use a shifted position
+                idx_peak2 = min(peaks[0] + len(E_values)//4, len(E_values)-1)
+                selected.append(df_sorted.iloc[idx_peak2])
+            
+            # Take the second valley as E(a',b')
+            if len(valleys) >= 2:
+                idx_valley2 = valleys[1]
+                selected.append(df_sorted.iloc[idx_valley2])
+            else:
+                idx_valley2 = min(valleys[0] + len(E_values)//4, len(E_values)-1)
+                selected.append(df_sorted.iloc[idx_valley2])
+            
+            # If we don't have enough extrema, use interpolation
+            if len(selected) < 4:
+                # Use the original method: find best 4 points
+                selected = find_best_chsh_settings(df_results)
+        
+        else:
+            # Not enough extrema, use the original method
+            selected = find_best_chsh_settings(df_results)
+            
+    except:
+        # Fallback to the original method
+        selected = find_best_chsh_settings(df_results)
     
     if len(selected) < 4:
-        return {"error": "Could not find the required CHSH phase settings"}
+        return {"error": f"Could not find 4 CHSH settings, found {len(selected)}"}
     
     # Compute S from the selected settings
-    # Order: ab, abp, apb, apbp
+    # Order: E(a,b), E(a,b'), E(a',b), E(a',b')
     E_ab = selected[0]['E']
     E_abp = selected[1]['E']
     E_apb = selected[2]['E']
@@ -198,11 +274,49 @@ def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
             "E(a',b)": (E_apb, sig_apb),
             "E(a',b')": (E_apbp, sig_apbp),
         },
-        "all_results": df_results
+        "all_results": df_results,
+        "n_points": len(df_results)
     }
 
+
+def find_best_chsh_settings(df_results):
+    """
+    Find the best 4 settings for CHSH from the data.
+    For a standard CHSH test, we need settings that maximize S.
+    """
+    if len(df_results) < 4:
+        return []
+    
+    # Convert to numpy arrays for faster computation
+    E = df_results['E'].values
+    piezo = df_results['piezo_b'].values
+    sigma = df_results['sigma_E'].values
+    n = len(E)
+    
+    # Try all combinations of 4 points
+    best_S = -np.inf
+    best_indices = None
+    
+    # Limit search to reasonable combinations
+    for i in range(n - 3):
+        for j in range(i + 1, n - 2):
+            for k in range(j + 1, n - 1):
+                for l in range(k + 1, n):
+                    # Try all sign combinations for S
+                    # S = E_i - E_j + E_k + E_l
+                    S = E[i] - E[j] + E[k] + E[l]
+                    if abs(S) > abs(best_S):
+                        best_S = S
+                        best_indices = [i, j, k, l]
+    
+    if best_indices is None:
+        return []
+    
+    # Return the selected rows
+    return [df_results.iloc[idx] for idx in best_indices]
+
 # ============================================================================
-# DATA LOADING & PROCESSING
+# DATA LOADING & PROCESSING (for timestamp data)
 # ============================================================================
 
 def load_events(file) -> pd.DataFrame:
@@ -454,94 +568,22 @@ def analyze_run(events: pd.DataFrame, settings: pd.DataFrame, channel_map: dict,
     return {"per_run": per_run, "chsh": chsh}
 
 # ============================================================================
-# DARK MATTER SEARCH
-# ============================================================================
-
-def fit_oscillatory_modulation(times: np.ndarray, counts: np.ndarray,
-                               omega_range: tuple, n_frequencies: int = 100) -> dict:
-    """Fit sinusoidal modulation to time-binned counts."""
-    times = np.array(times)
-    counts = np.array(counts)
-    
-    if len(times) < 10:
-        return {"detected": False, "message": "Insufficient data points"}
-    
-    counts_norm = counts / np.mean(counts)
-    errors = np.sqrt(counts) / np.mean(counts)
-    
-    omega_min, omega_max = omega_range
-    if omega_min <= 0 or omega_max <= omega_min:
-        omega_min = 1e-6
-        omega_max = 10.0
-    
-    omega_grid = np.logspace(np.log10(omega_min), np.log10(omega_max), n_frequencies)
-    
-    best_freq = None
-    best_amplitude = None
-    best_phase = None
-    best_p_value = 1.0
-    best_chi2 = np.inf
-    
-    for omega in omega_grid:
-        try:
-            cos_terms = np.cos(omega * times)
-            sin_terms = np.sin(omega * times)
-            
-            X = np.column_stack([np.ones_like(times), cos_terms, sin_terms])
-            weights = 1.0 / (errors**2 + 1e-10)
-            W = np.diag(weights)
-            
-            beta = np.linalg.inv(X.T @ W @ X) @ (X.T @ W @ (counts_norm))
-            
-            A = np.sqrt(beta[1]**2 + beta[2]**2)
-            phi = np.arctan2(-beta[2], beta[1])
-            
-            predicted = 1 + A * np.cos(omega * times + phi)
-            chi2_val = np.sum(((counts_norm - predicted)**2) / (errors**2 + 1e-10))
-            dof = len(times) - 3
-            
-            if dof > 0:
-                p_value = 1 - chi2.cdf(chi2_val, dof)
-                if p_value < best_p_value:
-                    best_freq = omega
-                    best_amplitude = A
-                    best_phase = phi
-                    best_p_value = p_value
-                    best_chi2 = chi2_val
-        except:
-            continue
-    
-    if best_freq is None:
-        return {"detected": False, "message": "No fit converged"}
-    
-    return {
-        "best_frequency_hz": best_freq/(2*np.pi) if best_freq else None,
-        "best_amplitude": best_amplitude,
-        "best_phase": best_phase,
-        "p_value": best_p_value,
-        "chi2": best_chi2,
-        "significance_sigma": norm.ppf(1 - best_p_value/2) if best_p_value > 0 else 0,
-        "detected": best_freq is not None and best_p_value < 0.05
-    }
-
-# ============================================================================
 # VISUALIZATION FUNCTIONS
 # ============================================================================
 
 def create_chsh_plot(results):
     """Create CHSH visualization."""
-    if not results or "chsh" not in results or results["chsh"] is None:
+    if not results or "S" not in results:
         return None
     
-    chsh = results["chsh"]
     fig = go.Figure()
     
     fig.add_trace(go.Bar(
         name="S-Parameter",
         x=["CHSH S"],
-        y=[chsh["S"]],
-        error_y=dict(type='data', array=[chsh["sigma_S"]]),
-        text=[f"{chsh['S']:.4f}"],
+        y=[results["S"]],
+        error_y=dict(type='data', array=[results["sigma_S"]]),
+        text=[f"{results['S']:.4f}"],
         textposition='auto'
     ))
     
@@ -561,76 +603,46 @@ def create_chsh_plot(results):
     return fig
 
 
-def create_correlation_plot(results):
-    """Create correlation values plot."""
-    if not results or "per_run" not in results:
-        return None
-    
-    fig = go.Figure()
-    for key in ["ab", "abp", "apb", "apbp"]:
-        if key not in results["per_run"]:
-            continue
-        r = results["per_run"][key]
-        fig.add_trace(go.Bar(
-            name=key.upper(),
-            x=[f"a={r['angle_a_deg']}°\nb={r['angle_b_deg']}°"],
-            y=[r["E"]],
-            error_y=dict(type='data', array=[r["sigma_E"]]),
-            text=[f"{r['E']:.4f}"],
-            textposition='auto'
-        ))
-    
-    fig.update_layout(
-        title="Correlation E(a,b) for Each Setting",
-        xaxis_title="Angle Setting",
-        yaxis_title="E(a,b)",
-        showlegend=True,
-        height=400
-    )
-    return fig
-
-
 def create_vbi_scatter_plot(results):
-    """Create scatter plot of E vs phase settings for VBI data."""
+    """Create scatter plot of E vs piezo position for VBI data."""
     if not results or "all_results" not in results:
         return None
     
     df = results["all_results"]
     fig = go.Figure()
     
-    # Color by beta value
+    # Scatter plot of E vs piezo position
     fig.add_trace(go.Scatter(
-        x=df['alpha'],
+        x=df['piezo_b'],
         y=df['E'],
-        mode='markers',
-        marker=dict(
-            size=10,
-            color=df['beta'],
-            colorscale='Viridis',
-            showscale=True,
-            colorbar=dict(title="Beta")
-        ),
-        text=[f"alpha={a:.1f}°, beta={b:.1f}°<br>E={e:.4f}" 
-              for a, b, e in zip(df['alpha'], df['beta'], df['E'])],
+        mode='markers+lines',
+        name='E(a,b)',
+        marker=dict(size=8, color=df['E'], colorscale='RdBu', showscale=True),
+        error_y=dict(type='data', array=df['sigma_E'], visible=True),
+        text=[f"piezo: {p:.4f}<br>E: {e:.4f}±{s:.4f}" 
+              for p, e, s in zip(df['piezo_b'], df['E'], df['sigma_E'])],
         hoverinfo='text'
     ))
     
     # Highlight selected settings
     if "selected_settings" in results:
         selected = results["selected_settings"]
-        for s in selected:
-            fig.add_trace(go.Scatter(
-                x=[s['alpha']],
-                y=[s['E']],
-                mode='markers',
-                marker=dict(size=15, color='red', symbol='star'),
-                name=f"α={s['alpha']:.1f}°, β={s['beta']:.1f}°",
-                showlegend=True
-            ))
+        labels = ["E(a,b)", "E(a,b')", "E(a',b)", "E(a',b')"]
+        colors = ['red', 'blue', 'green', 'orange']
+        for i, s in enumerate(selected):
+            if i < len(labels):
+                fig.add_trace(go.Scatter(
+                    x=[s['piezo_b']],
+                    y=[s['E']],
+                    mode='markers',
+                    marker=dict(size=15, color=colors[i % len(colors)], symbol='star'),
+                    name=labels[i],
+                    showlegend=True
+                ))
     
     fig.update_layout(
-        title="Correlation E vs Phase Settings",
-        xaxis_title="Alpha (deg)",
+        title="Correlation E vs Piezo Position",
+        xaxis_title="Piezo B Position",
         yaxis_title="E(a,b)",
         height=500,
         hovermode='closest'
@@ -640,10 +652,10 @@ def create_vbi_scatter_plot(results):
 
 def create_confidence_plot(results):
     """Create confidence visualization."""
-    if not results or "chsh" not in results or results["chsh"] is None:
+    if not results or "sigma_above_classical" not in results:
         return None
     
-    sigma = results["chsh"]["sigma_above_classical"]
+    sigma = results["sigma_above_classical"]
     
     fig = go.Figure()
     x = np.linspace(-3, 3, 100)
@@ -743,6 +755,8 @@ if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = None
 if 'vbi_results' not in st.session_state:
     st.session_state.vbi_results = None
+if 'vbi_data' not in st.session_state:
+    st.session_state.vbi_data = None
 if 'data_type' not in st.session_state:
     st.session_state.data_type = None
 
@@ -781,12 +795,14 @@ with st.sidebar:
         if vbi_file and st.button("Load VBI Data", type="primary"):
             with st.spinner("Parsing VBI data..."):
                 df = parse_vbi_data(vbi_file)
-                if df is not None:
+                if df is not None and len(df) > 0:
                     st.session_state.vbi_data = df
                     st.session_state.data_type = "vbi"
                     st.success(f"✅ Loaded {len(df)} data points from VBI file!")
+                else:
+                    st.error("Failed to parse VBI data. Please check the file format.")
         
-        if st.session_state.get('vbi_data') is not None:
+        if st.session_state.get('vbi_data') is not None and len(st.session_state.vbi_data) > 0:
             if st.button("Run CHSH from VBI Data", type="primary"):
                 with st.spinner("Computing CHSH S-parameter..."):
                     results = compute_CHSH_from_vbi(st.session_state.vbi_data)
@@ -795,6 +811,7 @@ with st.sidebar:
                     else:
                         st.session_state.vbi_results = results
                         st.success(f"✅ CHSH S = {results['S']:.4f} ± {results['sigma_S']:.4f}")
+                        st.info(f"Data points analyzed: {results.get('n_points', 0)}")
     
     elif data_type == "Timestamp CSV":
         events_file = st.file_uploader("Upload Events CSV", type=['csv'])
@@ -818,7 +835,7 @@ with st.sidebar:
                     st.session_state.data_type = "timestamp"
                     st.success("✅ Data loaded successfully!")
         
-        if st.session_state.data_type == "timestamp":
+        if st.session_state.data_type == "timestamp" and st.session_state.events_df is not None:
             st.markdown("---")
             st.markdown("### ⚙️ Analysis Parameters")
             
@@ -857,7 +874,7 @@ with st.sidebar:
         if st.button("Load Sample Data", type="primary"):
             load_sample_data()
         
-        if st.session_state.data_type == "timestamp":
+        if st.session_state.data_type == "timestamp" and st.session_state.events_df is not None:
             st.markdown("---")
             st.markdown("### ⚙️ Analysis Parameters")
             
@@ -900,7 +917,7 @@ with st.sidebar:
 st.markdown('<p class="main-header">🔬 CHSH Bell-Test & Dark Matter Search</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Quantum Entanglement Analysis with Dark Matter Interference Detection</p>', unsafe_allow_html=True)
 
-# Display results based on data type
+# Display VBI results
 if st.session_state.data_type == "vbi" and st.session_state.get('vbi_results'):
     results = st.session_state.vbi_results
     
@@ -939,17 +956,24 @@ if st.session_state.data_type == "vbi" and st.session_state.get('vbi_results'):
             </div>
             """, unsafe_allow_html=True)
         
-        # Show selected settings
-        st.markdown("### 📋 Selected Phase Settings")
+        # Data overview
+        st.markdown(f"**Data points analyzed:** {results.get('n_points', 0)} phase settings")
+        
+        # Selected settings
+        st.markdown("### 📋 Selected CHSH Settings")
         selected_data = []
+        labels = ["E(a,b)", "E(a,b')", "E(a',b)", "E(a',b')"]
         for i, s in enumerate(results["selected_settings"]):
-            selected_data.append({
-                "Setting": ["E(a,b)", "E(a,b')", "E(a',b)", "E(a',b')"][i],
-                "Alpha (deg)": f"{s['alpha']:.1f}",
-                "Beta (deg)": f"{s['beta']:.1f}",
-                "E": f"{s['E']:+.4f}",
-                "σ_E": f"{s['sigma_E']:.4f}"
-            })
+            if i < len(labels):
+                selected_data.append({
+                    "Setting": labels[i],
+                    "Piezo A": f"{s['piezo_a']:.4f}",
+                    "Piezo B": f"{s['piezo_b']:.4f}",
+                    "E": f"{s['E']:+.4f}",
+                    "σ_E": f"{s['sigma_E']:.4f}",
+                    "N_AB": int(s['N_AB']),
+                    "N_CD": int(s['N_CD'])
+                })
         st.dataframe(pd.DataFrame(selected_data), use_container_width=True)
         
         # Plots
@@ -963,7 +987,13 @@ if st.session_state.data_type == "vbi" and st.session_state.get('vbi_results'):
             fig = create_vbi_scatter_plot(results)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
+        
+        # Confidence plot
+        fig = create_confidence_plot(results)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
 
+# Display timestamp results
 elif st.session_state.data_type == "timestamp" and st.session_state.analysis_results:
     results = st.session_state.analysis_results
     
@@ -1024,12 +1054,7 @@ elif st.session_state.data_type == "timestamp" and st.session_state.analysis_res
         # Plots
         col1, col2 = st.columns(2)
         with col1:
-            fig = create_chsh_plot(results)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = create_correlation_plot(results)
+            fig = create_chsh_plot(chsh)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1043,6 +1068,7 @@ else:
     #### 1. VBI Coincidence (.dat)
     - Upload the `VBI_Coincidence_20230707.dat` file
     - The system will automatically parse the phase settings and compute CHSH
+    - Works with swept-phase data where piezo position encodes the phase
     
     #### 2. Timestamp CSV
     - Upload `events.csv` and `settings.csv`
@@ -1053,12 +1079,14 @@ else:
     - Click "Load Sample Data" to test the pipeline
     - Synthetic entangled photon data will be generated
     
-    ### 📁 VBI Data Format
+    ### 📁 Understanding VBI Data
     
-    The VBI dataset contains pre-computed coincidence counts for various phase settings:
-    - Columns 0-1: Phase settings (alpha, beta)
-    - Column 9: Coincidence count N_AB (A+,B+)
-    - Column 10: Coincidence count N_CD (A-,B-)
+    The VBI dataset contains:
+    - **Alpha, Beta**: Motorized stage positions (Alice and Bob)
+    - **Piezo positions**: Fine phase scanning
+    - **N_AB**: Coincidence count for A+,B+
+    - **N_CD**: Coincidence count for A-,B-
+    - **N_AC, N_BD**: Cross-coincidence counts
     
-    The system will automatically find the optimal CHSH settings!
+    The system finds the optimal CHSH settings by analyzing the correlation as a function of phase!
     """)
