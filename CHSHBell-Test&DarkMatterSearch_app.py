@@ -1,7 +1,7 @@
 """
 🔬 CHSH Bell-Test & Dark Matter Search - Complete Pipeline
 ===========================================================
-Supports VBI_Coincidence dataset format with swept-phase scanning.
+Supports VBI_Coincidence dataset format with proper phase extraction.
 """
 
 import streamlit as st
@@ -32,12 +32,7 @@ warnings.filterwarnings('ignore')
 
 HBAR = 6.582119569e-16  # eV·s
 C = 2.99792458e8  # m/s
-PC_TO_M = 3.08567758e16
-KPC_TO_M = PC_TO_M * 1000
-SOLAR_MASS = 1.98847e30  # kg
-G_NEWTON = 6.67430e-11
-SIDEREAL_DAY_S = 86164.0905
-SOLAR_DAY_S = 86400.0
+PI = np.pi
 
 # ============================================================================
 # VBI DATA FORMAT PARSER (Fixed)
@@ -79,6 +74,8 @@ def parse_vbi_data(file) -> pd.DataFrame:
         
         # Try to get cross-coincidences if available
         if df.shape[1] > 12:
+            # Column 11 might be N_AC (A+B-)
+            # Column 12 might be N_BD (A-B+)
             data['N_AC'] = df[11] if df.shape[1] > 11 else 0
             data['N_BD'] = df[12] if df.shape[1] > 12 else 0
         else:
@@ -90,10 +87,33 @@ def parse_vbi_data(file) -> pd.DataFrame:
         # Filter out rows with zero coincidences
         df_processed = df_processed[(df_processed['N_AB'] > 0) & (df_processed['N_CD'] > 0)]
         
-        # Round the phase settings to identify unique settings
-        # The motorized stages are fixed, piezo scans the phase
-        df_processed['alpha_rounded'] = np.round(df_processed['alpha'] * 10) / 10
-        df_processed['beta_rounded'] = np.round(df_processed['beta'] * 10) / 10
+        # The phase is encoded in the piezo positions
+        # In this dataset, alpha and beta are fixed, piezo scans the phase
+        # We'll use the piezo_b position as the phase indicator
+        # But we need to handle the fact that the values are very close
+        # We'll scale and shift to get meaningful phase values
+        
+        # For this dataset, the phase is proportional to the piezo position
+        # We'll use the relative piezo position within the scan range
+        piezo_min = df_processed['piezo_b'].min()
+        piezo_max = df_processed['piezo_b'].max()
+        piezo_range = piezo_max - piezo_min
+        
+        if piezo_range > 0:
+            # Normalize piezo position to [0, 2*PI] phase range
+            df_processed['phase'] = 2 * PI * (df_processed['piezo_b'] - piezo_min) / piezo_range
+        else:
+            # If no range, use the raw value
+            df_processed['phase'] = df_processed['piezo_b']
+        
+        # Also compute the phase from piezo_a as a check
+        piezo_a_min = df_processed['piezo_a'].min()
+        piezo_a_max = df_processed['piezo_a'].max()
+        piezo_a_range = piezo_a_max - piezo_a_min
+        if piezo_a_range > 0:
+            df_processed['phase_a'] = 2 * PI * (df_processed['piezo_a'] - piezo_a_min) / piezo_a_range
+        else:
+            df_processed['phase_a'] = df_processed['piezo_a']
         
         return df_processed
     except Exception as e:
@@ -103,58 +123,62 @@ def parse_vbi_data(file) -> pd.DataFrame:
 
 def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
     """
-    Compute CHSH S-parameter from VBI data using swept-phase analysis.
-    The data is taken at fixed alpha,beta with scanning piezo phase.
-    We need to find the phase settings that maximize S.
+    Compute CHSH S-parameter from VBI data.
+    Uses the phase encoded in piezo positions to find the optimal settings.
     """
     if df is None or len(df) == 0:
         return {"error": "No data to analyze"}
     
-    # Group by alpha and beta (motorized stages)
-    # In this dataset, alpha and beta are fixed, piezo scans the phase
-    alpha_val = df['alpha_rounded'].iloc[0]
-    beta_val = df['beta_rounded'].iloc[0]
+    st.info(f"Analyzing {len(df)} data points")
     
-    st.info(f"Analyzing data at α = {alpha_val:.1f}°, β = {beta_val:.1f}°")
+    # Use the phase from piezo_b (or phase_a if phase_b is not varying)
+    phase_col = 'phase' if df['phase'].nunique() > 1 else 'phase_a'
+    df['phase_used'] = df[phase_col]
     
-    # For swept phase, we need to identify the phase values from piezo positions
-    # The phase is encoded in the piezo position (column 2)
-    # We'll bin the data by piezo position to find unique phase settings
+    # Group by phase to get unique phase settings
+    # Use a small bin size to capture the variation
+    n_bins = min(50, len(df) // 5)
+    if n_bins < 4:
+        n_bins = len(df)
     
-    # Group by piezo position (which encodes the phase)
-    piezo_bins = np.linspace(df['piezo_b'].min(), df['piezo_b'].max(), 100)
-    df['piezo_bin'] = np.digitize(df['piezo_b'], piezo_bins)
+    # Bin the data by phase
+    phase_bins = np.linspace(df['phase_used'].min(), df['phase_used'].max(), n_bins + 1)
+    df['phase_bin'] = np.digitize(df['phase_used'], phase_bins)
     
-    # Average the data in each piezo bin
-    grouped = df.groupby('piezo_bin').agg({
+    # Average the data in each phase bin
+    grouped = df.groupby('phase_bin').agg({
         'N_AB': 'mean',
         'N_CD': 'mean',
         'N_AC': 'mean',
         'N_BD': 'mean',
+        'phase_used': 'mean',
         'piezo_a': 'mean',
-        'piezo_b': 'mean'
+        'piezo_b': 'mean',
+        'alpha': 'first',
+        'beta': 'first'
     }).reset_index()
     
     # Compute E for each phase setting
     results = []
     for _, row in grouped.iterrows():
-        N_AB = row['N_AB']
-        N_CD = row['N_CD']
-        N_AC = row['N_AC'] if not np.isnan(row['N_AC']) else 0
-        N_BD = row['N_BD'] if not np.isnan(row['N_BD']) else 0
+        N_AB = max(0, row['N_AB'])
+        N_CD = max(0, row['N_CD'])
+        N_AC = max(0, row['N_AC']) if not np.isnan(row['N_AC']) else 0
+        N_BD = max(0, row['N_BD']) if not np.isnan(row['N_BD']) else 0
         
         total = N_AB + N_CD + N_AC + N_BD
-        if total == 0:
+        if total < 1:
             continue
         
         E = (N_AB + N_CD - N_AC - N_BD) / total
         sigma_E = np.sqrt(N_AB + N_CD + N_AC + N_BD) / total
         
         results.append({
-            'alpha': alpha_val,
-            'beta': beta_val,
+            'phase': row['phase_used'],
             'piezo_a': row['piezo_a'],
             'piezo_b': row['piezo_b'],
+            'alpha': row['alpha'],
+            'beta': row['beta'],
             'E': E,
             'sigma_E': sigma_E,
             'N_AB': N_AB,
@@ -169,78 +193,95 @@ def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
     
     df_results = pd.DataFrame(results)
     
+    # Sort by phase
+    df_results = df_results.sort_values('phase').reset_index(drop=True)
+    
     # Find the 4 settings that maximize S
     # For CHSH, we need: (a,b), (a,b'), (a',b), (a',b')
-    # With a=0, a'=45, b=22.5, b'=67.5 (or close to these)
-    # Since alpha and beta are fixed, we need to find the phase values
+    # In a swept-phase experiment, these correspond to 4 specific phase values
     
-    # The phase is encoded in the piezo position
-    # We'll use the piezo_b position as the phase indicator
+    # Use the standard method: find the extrema of E vs phase
+    # The CHSH settings are at the peaks and valleys of the correlation
+    E_values = df_results['E'].values
+    phase_values = df_results['phase'].values
+    sigma_values = df_results['sigma_E'].values
+    n = len(E_values)
     
-    # Find the piezo positions that give the maximum and minimum E
-    # For a typical CHSH scan, E oscillates sinusoidally with phase
+    # Find peaks and valleys using simple derivative
+    peaks = []
+    valleys = []
     
-    # Sort by piezo position
-    df_sorted = df_results.sort_values('piezo_b').reset_index(drop=True)
+    for i in range(1, n - 1):
+        if E_values[i] > E_values[i-1] and E_values[i] > E_values[i+1]:
+            peaks.append(i)
+        if E_values[i] < E_values[i-1] and E_values[i] < E_values[i+1]:
+            valleys.append(i)
     
-    # Find the extrema and zero crossings of E
-    # We need 4 settings: two for Alice (a, a') and two for Bob (b, b')
-    
-    # Look for the positions where E is maximized and minimized
-    # These correspond to specific phase settings
-    
-    # Find peaks and valleys in E vs piezo_b
-    E_values = df_sorted['E'].values
-    piezo_values = df_sorted['piezo_b'].values
-    
-    # Use FFT to find the oscillation period
-    try:
-        from scipy.signal import find_peaks
-        peaks, _ = find_peaks(E_values, prominence=0.1)
-        valleys, _ = find_peaks(-E_values, prominence=0.1)
+    # If we don't have enough peaks/valleys, use the extrema of the data
+    if len(peaks) < 2 or len(valleys) < 2:
+        # Find the global extrema
+        max_idx = np.argmax(E_values)
+        min_idx = np.argmin(E_values)
         
-        if len(peaks) >= 2 and len(valleys) >= 2:
-            # We have enough extrema
-            # Select the best 4 settings
-            selected = []
-            
-            # Take the first peak as E(a,b) (max positive correlation)
-            idx_peak1 = peaks[0]
-            selected.append(df_sorted.iloc[idx_peak1])
-            
-            # Take the first valley as E(a,b') (max negative correlation)
-            idx_valley1 = valleys[0]
-            selected.append(df_sorted.iloc[idx_valley1])
-            
-            # Take the second peak as E(a',b) 
-            if len(peaks) >= 2:
-                idx_peak2 = peaks[1]
-                selected.append(df_sorted.iloc[idx_peak2])
-            else:
-                # If not enough peaks, use a shifted position
-                idx_peak2 = min(peaks[0] + len(E_values)//4, len(E_values)-1)
-                selected.append(df_sorted.iloc[idx_peak2])
-            
-            # Take the second valley as E(a',b')
-            if len(valleys) >= 2:
-                idx_valley2 = valleys[1]
-                selected.append(df_sorted.iloc[idx_valley2])
-            else:
-                idx_valley2 = min(valleys[0] + len(E_values)//4, len(E_values)-1)
-                selected.append(df_sorted.iloc[idx_valley2])
-            
-            # If we don't have enough extrema, use interpolation
-            if len(selected) < 4:
-                # Use the original method: find best 4 points
-                selected = find_best_chsh_settings(df_results)
-        
+        # Find the next extrema by searching away from the global ones
+        # For peaks: search in the remaining data
+        remaining = [i for i in range(n) if i != max_idx and i != min_idx]
+        if len(remaining) > 0:
+            # Find the next max and min
+            second_max_idx = max(remaining, key=lambda i: E_values[i])
+            second_min_idx = min(remaining, key=lambda i: E_values[i])
         else:
-            # Not enough extrema, use the original method
-            selected = find_best_chsh_settings(df_results)
-            
-    except:
-        # Fallback to the original method
-        selected = find_best_chsh_settings(df_results)
+            # If not enough points, use the edges
+            second_max_idx = min(1, n-1)
+            second_min_idx = max(1, n-2)
+        
+        # Use these as our peak/valley positions
+        peaks = [max_idx, second_max_idx]
+        valleys = [min_idx, second_min_idx]
+    
+    # Sort peaks and valleys by phase
+    peaks = sorted(peaks)
+    valleys = sorted(valleys)
+    
+    # Select the 4 settings
+    # E(a,b) = first peak (max correlation)
+    # E(a,b') = first valley (min correlation)
+    # E(a',b) = second peak
+    # E(a',b') = second valley
+    selected_indices = []
+    
+    if len(peaks) >= 1:
+        selected_indices.append(peaks[0])
+    if len(valleys) >= 1:
+        selected_indices.append(valleys[0])
+    if len(peaks) >= 2:
+        selected_indices.append(peaks[1])
+    elif len(peaks) == 1:
+        # If only one peak, use the other side
+        idx = min(peaks[0] + n//4, n-1)
+        selected_indices.append(idx)
+    else:
+        selected_indices.append(min(1, n-1))
+    
+    if len(valleys) >= 2:
+        selected_indices.append(valleys[1])
+    elif len(valleys) == 1:
+        idx = max(valleys[0] - n//4, 0)
+        selected_indices.append(idx)
+    else:
+        selected_indices.append(max(n-2, 0))
+    
+    # Ensure we have exactly 4 unique indices
+    selected_indices = list(dict.fromkeys(selected_indices))
+    while len(selected_indices) < 4:
+        idx = (selected_indices[-1] + 1) % n
+        if idx not in selected_indices:
+            selected_indices.append(idx)
+    
+    selected_indices = sorted(selected_indices)[:4]
+    
+    # Get the selected rows
+    selected = [df_results.iloc[idx] for idx in selected_indices]
     
     if len(selected) < 4:
         return {"error": f"Could not find 4 CHSH settings, found {len(selected)}"}
@@ -275,45 +316,10 @@ def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
             "E(a',b')": (E_apbp, sig_apbp),
         },
         "all_results": df_results,
-        "n_points": len(df_results)
+        "n_points": len(df_results),
+        "peaks": peaks,
+        "valleys": valleys
     }
-
-
-def find_best_chsh_settings(df_results):
-    """
-    Find the best 4 settings for CHSH from the data.
-    For a standard CHSH test, we need settings that maximize S.
-    """
-    if len(df_results) < 4:
-        return []
-    
-    # Convert to numpy arrays for faster computation
-    E = df_results['E'].values
-    piezo = df_results['piezo_b'].values
-    sigma = df_results['sigma_E'].values
-    n = len(E)
-    
-    # Try all combinations of 4 points
-    best_S = -np.inf
-    best_indices = None
-    
-    # Limit search to reasonable combinations
-    for i in range(n - 3):
-        for j in range(i + 1, n - 2):
-            for k in range(j + 1, n - 1):
-                for l in range(k + 1, n):
-                    # Try all sign combinations for S
-                    # S = E_i - E_j + E_k + E_l
-                    S = E[i] - E[j] + E[k] + E[l]
-                    if abs(S) > abs(best_S):
-                        best_S = S
-                        best_indices = [i, j, k, l]
-    
-    if best_indices is None:
-        return []
-    
-    # Return the selected rows
-    return [df_results.iloc[idx] for idx in best_indices]
 
 # ============================================================================
 # DATA LOADING & PROCESSING (for timestamp data)
@@ -604,25 +610,50 @@ def create_chsh_plot(results):
 
 
 def create_vbi_scatter_plot(results):
-    """Create scatter plot of E vs piezo position for VBI data."""
+    """Create scatter plot of E vs phase for VBI data."""
     if not results or "all_results" not in results:
         return None
     
     df = results["all_results"]
     fig = go.Figure()
     
-    # Scatter plot of E vs piezo position
+    # Scatter plot of E vs phase
     fig.add_trace(go.Scatter(
-        x=df['piezo_b'],
+        x=df['phase'],
         y=df['E'],
         mode='markers+lines',
         name='E(a,b)',
         marker=dict(size=8, color=df['E'], colorscale='RdBu', showscale=True),
         error_y=dict(type='data', array=df['sigma_E'], visible=True),
-        text=[f"piezo: {p:.4f}<br>E: {e:.4f}±{s:.4f}" 
-              for p, e, s in zip(df['piezo_b'], df['E'], df['sigma_E'])],
+        text=[f"phase: {p:.3f}<br>E: {e:.4f}±{s:.4f}" 
+              for p, e, s in zip(df['phase'], df['E'], df['sigma_E'])],
         hoverinfo='text'
     ))
+    
+    # Mark peaks and valleys
+    if "peaks" in results:
+        for idx in results["peaks"]:
+            if idx < len(df):
+                fig.add_trace(go.Scatter(
+                    x=[df.iloc[idx]['phase']],
+                    y=[df.iloc[idx]['E']],
+                    mode='markers',
+                    marker=dict(size=12, color='red', symbol='triangle-up'),
+                    name=f'Peak {idx}',
+                    showlegend=False
+                ))
+    
+    if "valleys" in results:
+        for idx in results["valleys"]:
+            if idx < len(df):
+                fig.add_trace(go.Scatter(
+                    x=[df.iloc[idx]['phase']],
+                    y=[df.iloc[idx]['E']],
+                    mode='markers',
+                    marker=dict(size=12, color='blue', symbol='triangle-down'),
+                    name=f'Valley {idx}',
+                    showlegend=False
+                ))
     
     # Highlight selected settings
     if "selected_settings" in results:
@@ -632,7 +663,7 @@ def create_vbi_scatter_plot(results):
         for i, s in enumerate(selected):
             if i < len(labels):
                 fig.add_trace(go.Scatter(
-                    x=[s['piezo_b']],
+                    x=[s['phase']],
                     y=[s['E']],
                     mode='markers',
                     marker=dict(size=15, color=colors[i % len(colors)], symbol='star'),
@@ -641,8 +672,8 @@ def create_vbi_scatter_plot(results):
                 ))
     
     fig.update_layout(
-        title="Correlation E vs Piezo Position",
-        xaxis_title="Piezo B Position",
+        title="Correlation E vs Phase",
+        xaxis_title="Phase (radians)",
         yaxis_title="E(a,b)",
         height=500,
         hovermode='closest'
@@ -967,8 +998,7 @@ if st.session_state.data_type == "vbi" and st.session_state.get('vbi_results'):
             if i < len(labels):
                 selected_data.append({
                     "Setting": labels[i],
-                    "Piezo A": f"{s['piezo_a']:.4f}",
-                    "Piezo B": f"{s['piezo_b']:.4f}",
+                    "Phase": f"{s['phase']:.3f}",
                     "E": f"{s['E']:+.4f}",
                     "σ_E": f"{s['sigma_E']:.4f}",
                     "N_AB": int(s['N_AB']),
