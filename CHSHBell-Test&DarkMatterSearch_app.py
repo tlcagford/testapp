@@ -1,11 +1,7 @@
 """
 🔬 CHSH Bell-Test & Dark Matter Search - Complete Pipeline
 ===========================================================
-Single-file Streamlit application for analyzing photon coincidence data,
-computing CHSH Bell-test statistics, and searching for dark matter
-interference signatures.
-
-Author: Tony E. Ford | QCAUS Lab Analysis Tools
+Supports both timestamp-based data AND the VBI_Coincidence dataset format.
 """
 
 import streamlit as st
@@ -44,6 +40,168 @@ SIDEREAL_DAY_S = 86164.0905
 SOLAR_DAY_S = 86400.0
 
 # ============================================================================
+# VBI DATA FORMAT PARSER
+# ============================================================================
+
+def parse_vbi_data(file) -> pd.DataFrame:
+    """
+    Parse the VBI_Coincidence dataset format.
+    
+    Column structure (29 columns total):
+    0-1: Motorized stage positions (alpha, beta)
+    2-3: Piezo positions
+    4-7: Single counts on channels 1,2,3,4
+    8: Unknown
+    9: Coincidence counts between channels 1 and 2 (A+,B+)
+    10: Coincidence counts between channels 3 and 4 (A-,B-)
+    11-12: More coincidence counts (A+,B- and A-,B+)
+    13-28: Additional data (auxiliary channels, etc.)
+    """
+    try:
+        # Read the space-separated file
+        df = pd.read_csv(file, sep=r'\s+', header=None)
+        
+        # Extract relevant columns based on the known format
+        # Columns: alpha, beta, piezo_a, piezo_b, singles1, singles2, singles3, singles4,
+        #          ?, N12, N34, N13?, N24?, ... 
+        data = {
+            'alpha': df[0],      # Alice's phase setting
+            'beta': df[1],       # Bob's phase setting
+            'piezo_a': df[2],    # Piezo position A
+            'piezo_b': df[3],    # Piezo position B
+            'singles_1': df[4],  # Single counts channel 1
+            'singles_2': df[5],  # Single counts channel 2
+            'singles_3': df[6],  # Single counts channel 3
+            'singles_4': df[7],  # Single counts channel 4
+            'N_AB': df[9],       # Coincidence A+B+ (channels 1&2)
+            'N_CD': df[10],      # Coincidence A-B- (channels 3&4)
+        }
+        
+        # Try to get the other coincidence pairs if available
+        # In this dataset, columns 11 and 12 might contain the cross-coincidences
+        if df.shape[1] > 12:
+            data['N_AC'] = df[11] if df.shape[1] > 11 else 0  # A+B-
+            data['N_BD'] = df[12] if df.shape[1] > 12 else 0  # A-B+
+        else:
+            # Estimate cross coincidences from singles rates if not directly measured
+            data['N_AC'] = 0
+            data['N_BD'] = 0
+        
+        df_processed = pd.DataFrame(data)
+        
+        # Filter out rows with zero coincidences
+        df_processed = df_processed[(df_processed['N_AB'] > 0) & (df_processed['N_CD'] > 0)]
+        
+        return df_processed
+    except Exception as e:
+        st.error(f"Error parsing VBI data: {str(e)}")
+        return None
+
+def compute_CHSH_from_vbi(df: pd.DataFrame) -> dict:
+    """
+    Compute CHSH S-parameter from VBI data.
+    For each phase setting (alpha, beta), compute E(a,b) and find the optimal
+    combination that maximizes S.
+    """
+    if df is None or len(df) == 0:
+        return {"error": "No data to analyze"}
+    
+    # For each unique phase setting combination, compute E
+    results = []
+    for alpha, beta in df.groupby(['alpha', 'beta']).groups:
+        group = df[(df['alpha'] == alpha) & (df['beta'] == beta)]
+        
+        # Average the counts for this phase setting
+        N_AB = group['N_AB'].mean()
+        N_CD = group['N_CD'].mean()
+        N_AC = group['N_AC'].mean() if 'N_AC' in group.columns else 0
+        N_BD = group['N_BD'].mean() if 'N_BD' in group.columns else 0
+        
+        total = N_AB + N_CD + N_AC + N_BD
+        if total == 0:
+            continue
+        
+        # Compute E for this setting
+        E = (N_AB + N_CD - N_AC - N_BD) / total
+        
+        # Estimate error
+        sigma_E = np.sqrt(N_AB + N_CD + N_AC + N_BD) / total
+        
+        results.append({
+            'alpha': alpha,
+            'beta': beta,
+            'E': E,
+            'sigma_E': sigma_E,
+            'N_AB': N_AB,
+            'N_CD': N_CD,
+            'N_AC': N_AC,
+            'N_BD': N_BD,
+            'total': total
+        })
+    
+    if len(results) < 4:
+        return {"error": f"Need at least 4 phase settings, found {len(results)}"}
+    
+    df_results = pd.DataFrame(results)
+    
+    # Find the 4 settings that maximize S (typical CHSH angles)
+    # Try all combinations of 4 settings
+    max_S = -np.inf
+    best_combination = None
+    best_results = None
+    
+    # Common CHSH angle pairs: (0,22.5), (0,67.5), (45,22.5), (45,67.5)
+    # We'll search the data for settings closest to these
+    target_settings = [
+        (0, 22.5), (0, 67.5), (45, 22.5), (45, 67.5)
+    ]
+    
+    # For each target, find the closest actual setting in the data
+    selected = []
+    for target_alpha, target_beta in target_settings:
+        # Find the closest alpha
+        closest_alpha = df_results.iloc[(df_results['alpha'] - target_alpha).abs().argsort()[:3]]
+        # Among those, find the closest beta
+        closest = closest_alpha.iloc[(closest_alpha['beta'] - target_beta).abs().argsort()[:1]]
+        if len(closest) > 0:
+            selected.append(closest.iloc[0])
+    
+    if len(selected) < 4:
+        return {"error": "Could not find the required CHSH phase settings"}
+    
+    # Compute S from the selected settings
+    # Order: ab, abp, apb, apbp
+    E_ab = selected[0]['E']
+    E_abp = selected[1]['E']
+    E_apb = selected[2]['E']
+    E_apbp = selected[3]['E']
+    
+    sig_ab = selected[0]['sigma_E']
+    sig_abp = selected[1]['sigma_E']
+    sig_apb = selected[2]['sigma_E']
+    sig_apbp = selected[3]['sigma_E']
+    
+    S = E_ab - E_abp + E_apb + E_apbp
+    sigma_S = np.sqrt(sig_ab**2 + sig_abp**2 + sig_apb**2 + sig_apbp**2)
+    sigma_above = (abs(S) - 2.0) / sigma_S if sigma_S > 0 else 0
+    
+    return {
+        "S": S,
+        "sigma_S": sigma_S,
+        "sigma_above_classical": sigma_above,
+        "violates_classical_bound": abs(S) > 2.0,
+        "within_tsirelson_bound": abs(S) <= 2 * np.sqrt(2) + 1e-9,
+        "selected_settings": selected,
+        "E_values": {
+            "E(a,b)": (E_ab, sig_ab),
+            "E(a,b')": (E_abp, sig_abp),
+            "E(a',b)": (E_apb, sig_apb),
+            "E(a',b')": (E_apbp, sig_apbp),
+        },
+        "all_results": df_results
+    }
+
+# ============================================================================
 # DATA LOADING & PROCESSING
 # ============================================================================
 
@@ -75,7 +233,6 @@ def load_settings(file) -> pd.DataFrame:
         if missing:
             st.error(f"Settings file missing required column(s): {missing}")
             return None
-        # Add run_key column for compatibility
         df["run_key"] = df["run_id"].astype(str).str.lower()
         return df
     except Exception as e:
@@ -150,7 +307,7 @@ def generate_sample_data() -> tuple:
     return events_df, settings_df, channel_map
 
 # ============================================================================
-# COINCIDENCE COUNTING
+# COINCIDENCE COUNTING (for timestamp data)
 # ============================================================================
 
 @dataclass
@@ -222,7 +379,7 @@ def analyze_coincidences(events: pd.DataFrame, channel_map: dict, window_ns: flo
                               accidental_rate=accidentals, run_duration_s=duration_s)
 
 # ============================================================================
-# CHSH ANALYSIS
+# CHSH ANALYSIS (for timestamp data)
 # ============================================================================
 
 def correlation_E(coinc: CoincidenceResult, subtract_accidentals: bool = True) -> tuple:
@@ -254,7 +411,6 @@ def correlation_E(coinc: CoincidenceResult, subtract_accidentals: bool = True) -
 def analyze_run(events: pd.DataFrame, settings: pd.DataFrame, channel_map: dict,
                  window_ns: float, subtract_accidentals: bool = True) -> dict:
     """Full CHSH analysis pipeline."""
-    # Ensure settings has run_key
     settings = settings.copy()
     if "run_key" not in settings.columns:
         settings["run_key"] = settings["run_id"].astype(str).str.lower()
@@ -279,7 +435,6 @@ def analyze_run(events: pd.DataFrame, settings: pd.DataFrame, channel_map: dict,
             st.warning(f"Error analyzing run {key}: {str(e)}")
             continue
     
-    # Check if all required runs are present
     required = ["ab", "abp", "apb", "apbp"]
     missing = [r for r in required if r not in per_run]
     if missing:
@@ -301,66 +456,6 @@ def analyze_run(events: pd.DataFrame, settings: pd.DataFrame, channel_map: dict,
 # ============================================================================
 # DARK MATTER SEARCH
 # ============================================================================
-
-def bin_coincidences_by_time(events: pd.DataFrame, channel_map: dict,
-                             window_ns: float, bin_width_s: float,
-                             start_ns: float = None, end_ns: float = None,
-                             min_coincidences: int = 10) -> pd.DataFrame:
-    """Bin coincidence counts into time bins."""
-    df = events.copy()
-    if start_ns is not None:
-        df = df[df["timestamp_ns"] >= start_ns]
-    if end_ns is not None:
-        df = df[df["timestamp_ns"] <= end_ns]
-    
-    if len(df) == 0:
-        return pd.DataFrame(columns=["time_s", "pair", "counts"])
-    
-    df["label"] = df["channel"].map(channel_map)
-    if df["label"].isna().any():
-        return pd.DataFrame()
-    
-    df["time_s"] = df["timestamp_ns"] * 1e-9
-    start_time = df["time_s"].min()
-    end_time = df["time_s"].max()
-    
-    bins = np.arange(start_time, end_time, bin_width_s)
-    if len(bins) < 2:
-        return pd.DataFrame()
-    
-    bin_centers = bins[:-1] + bin_width_s/2
-    
-    results = []
-    for a_lbl in ("A+", "A-"):
-        for b_lbl in ("B+", "B-"):
-            times_a = df[df["label"] == a_lbl]["time_s"].values
-            times_b = df[df["label"] == b_lbl]["time_s"].values
-            
-            hist_a, _ = np.histogram(times_a, bins=bins)
-            hist_b, _ = np.histogram(times_b, bins=bins)
-            
-            for i, (na, nb) in enumerate(zip(hist_a, hist_b)):
-                if na > 0 and nb > 0:
-                    expected_coinc = na * nb * (2 * window_ns * 1e-9) / bin_width_s
-                    if expected_coinc > 0.1:
-                        results.append({
-                            "time_s": bin_centers[i],
-                            "pair": f"{a_lbl}_{b_lbl}",
-                            "counts": expected_coinc
-                        })
-    
-    if len(results) == 0:
-        return pd.DataFrame()
-    
-    df_results = pd.DataFrame(results)
-    if len(df_results) == 0:
-        return pd.DataFrame()
-    
-    df_results = df_results.groupby("time_s").filter(
-        lambda x: x["counts"].sum() >= min_coincidences
-    )
-    return df_results
-
 
 def fit_oscillatory_modulation(times: np.ndarray, counts: np.ndarray,
                                omega_range: tuple, n_frequencies: int = 100) -> dict:
@@ -429,199 +524,6 @@ def fit_oscillatory_modulation(times: np.ndarray, counts: np.ndarray,
         "detected": best_freq is not None and best_p_value < 0.05
     }
 
-
-def analyze_dark_matter(events: pd.DataFrame, settings: pd.DataFrame, 
-                        channel_map: dict, window_ns: float,
-                        dm_mass_eV: float = 1e-6, epsilon: float = 0.01) -> dict:
-    """Search for dark matter interference signatures."""
-    if events is None or settings is None or channel_map is None:
-        return {"error": "Data not loaded"}
-    
-    # Ensure settings has run_key
-    settings = settings.copy()
-    if "run_key" not in settings.columns:
-        settings["run_key"] = settings["run_id"].astype(str).str.lower()
-    
-    try:
-        # Get base results
-        base_result = analyze_run(events, settings, channel_map, window_ns)
-        if "error" in base_result:
-            return {"error": base_result["error"]}
-        
-        # Time-binned analysis
-        time_series_data = {}
-        for run_key in ["ab", "abp", "apb", "apbp"]:
-            row = settings[settings["run_key"] == run_key]
-            if len(row) == 0:
-                continue
-            
-            start_ns = row["start_ns"].values[0]
-            end_ns = row["end_ns"].values[0]
-            
-            # Use larger bin width for better statistics
-            duration_s = (end_ns - start_ns) * 1e-9
-            bin_width = max(1.0, duration_s / 20)  # At least 20 bins per run
-            
-            binned = bin_coincidences_by_time(
-                events, channel_map, window_ns, bin_width,
-                start_ns=start_ns, end_ns=end_ns
-            )
-            
-            if len(binned) == 0:
-                continue
-            
-            times = []
-            E_values = []
-            for time, group in binned.groupby("time_s"):
-                counts = group.set_index("pair")["counts"].to_dict()
-                if len(counts) < 4:
-                    continue
-                    
-                Npp = counts.get("A+_B+", 0)
-                Nmm = counts.get("A-_B-", 0)
-                Npm = counts.get("A+_B-", 0)
-                Nmp = counts.get("A-_B+", 0)
-                
-                total = Npp + Nmm + Npm + Nmp
-                if total == 0:
-                    continue
-                    
-                E = (Npp + Nmm - Npm - Nmp) / total
-                times.append(time)
-                E_values.append(E)
-            
-            if len(times) > 5:
-                time_series_data[run_key] = {
-                    "times": np.array(times),
-                    "E": np.array(E_values)
-                }
-        
-        # Search for oscillations
-        if len(time_series_data) >= 4:
-            # Combine all runs
-            all_times = []
-            all_E = []
-            for key in ["ab", "abp", "apb", "apbp"]:
-                if key in time_series_data:
-                    all_times.extend(time_series_data[key]["times"])
-                    all_E.extend(time_series_data[key]["E"])
-            
-            if len(all_times) > 20:
-                # Estimate frequency range from DM mass
-                omega_min = 0.1 * epsilon * dm_mass_eV * C**2 / HBAR
-                omega_max = 10.0 * epsilon * dm_mass_eV * C**2 / HBAR
-                
-                # Ensure reasonable range
-                if omega_min < 1e-6:
-                    omega_min = 1e-6
-                if omega_max > 1e6:
-                    omega_max = 1e6
-                
-                fit_result = fit_oscillatory_modulation(
-                    np.array(all_times), np.array(all_E),
-                    (omega_min, omega_max)
-                )
-                
-                return {
-                    "base_result": base_result,
-                    "time_series": time_series_data,
-                    "oscillation": fit_result,
-                    "omega_beat": fit_result["best_frequency_hz"] * 2 * np.pi if fit_result.get("best_frequency_hz") else None,
-                    "coupling_strength": fit_result.get("best_amplitude", 0) / 2 if fit_result.get("best_amplitude") else None,
-                    "detection_significance": fit_result.get("significance_sigma", 0)
-                }
-        
-        return {"base_result": base_result, "no_oscillation": True}
-    
-    except Exception as e:
-        return {"error": str(e)}
-
-# ============================================================================
-# SIDEREAL TIME ANALYSIS
-# ============================================================================
-
-def convert_to_sidereal_time(timestamps_ns: np.ndarray, 
-                             longitude_deg: float = -105.0) -> np.ndarray:
-    """Convert UTC timestamps to Local Sidereal Time."""
-    timestamps_s = timestamps_ns / 1e-9
-    # Simplified sidereal time calculation
-    jd = timestamps_s / 86400.0 + 2440587.5  # Approximate JD
-    gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0)
-    gmst = gmst % 360
-    lst = (gmst + longitude_deg) % 360
-    return lst
-
-
-def analyze_sidereal(events: pd.DataFrame, channel_map: dict, window_ns: float,
-                     longitude: float = -105.0) -> dict:
-    """Analyze sidereal time modulation."""
-    if events is None or channel_map is None:
-        return {"error": "Data not loaded"}
-    
-    try:
-        # Convert timestamps to sidereal time
-        timestamps = events['timestamp_ns'].values
-        sidereal_times = convert_to_sidereal_time(timestamps, longitude)
-        
-        events_copy = events.copy()
-        events_copy['sidereal_time_deg'] = sidereal_times
-        events_copy['sidereal_hour'] = (events_copy['sidereal_time_deg'] / 15.0).astype(int) % 24
-        
-        # Bin by sidereal hour
-        results = []
-        for hour in range(24):
-            mask = events_copy['sidereal_hour'] == hour
-            hour_events = events_copy[mask]
-            
-            if len(hour_events) > 100:
-                try:
-                    coinc = analyze_coincidences(hour_events, channel_map, window_ns)
-                    E, sigma_E, _ = correlation_E(coinc, subtract_accidentals=True)
-                    results.append({
-                        'sidereal_hour': hour,
-                        'sidereal_angle_deg': hour * 15.0,
-                        'E': E,
-                        'sigma_E': sigma_E,
-                        'counts': len(hour_events)
-                    })
-                except:
-                    pass
-        
-        if len(results) < 10:
-            return {"error": "Insufficient data for sidereal analysis"}
-        
-        df = pd.DataFrame(results)
-        
-        # Fit sinusoidal modulation
-        hours = df['sidereal_hour'].values
-        E_values = df['E'].values
-        errors = df['sigma_E'].values
-        
-        def model(t, E0, A, phi):
-            return E0 + A * np.cos(2 * np.pi * t / 24 + phi)
-        
-        try:
-            popt, pcov = curve_fit(model, hours, E_values, sigma=errors,
-                                   p0=[np.mean(E_values), 0.01, 0.0])
-            E0, A, phi = popt
-            perr = np.sqrt(np.diag(pcov))
-            sigma_A = A / perr[1] if perr[1] > 0 else 0
-            
-            return {
-                "data": df,
-                "E0": E0,
-                "amplitude": A,
-                "amplitude_error": perr[1],
-                "phase": phi,
-                "significance": sigma_A,
-                "detected": abs(sigma_A) > 3.0
-            }
-        except:
-            return {"data": df, "error": "Fit failed"}
-    
-    except Exception as e:
-        return {"error": str(e)}
-
 # ============================================================================
 # VISUALIZATION FUNCTIONS
 # ============================================================================
@@ -634,7 +536,6 @@ def create_chsh_plot(results):
     chsh = results["chsh"]
     fig = go.Figure()
     
-    # S parameter
     fig.add_trace(go.Bar(
         name="S-Parameter",
         x=["CHSH S"],
@@ -644,7 +545,6 @@ def create_chsh_plot(results):
         textposition='auto'
     ))
     
-    # Bounds
     fig.add_hline(y=2.0, line_dash="dash", line_color="red", 
                   annotation_text="Classical Bound (2)")
     fig.add_hline(y=-2.0, line_dash="dash", line_color="red")
@@ -690,132 +590,51 @@ def create_correlation_plot(results):
     return fig
 
 
-def create_dm_oscillation_plot(time_series, oscillation):
-    """Create dark matter oscillation plot."""
-    fig = go.Figure()
-    
-    if not time_series:
-        fig.update_layout(title="No time series data available", height=400)
-        return fig
-    
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-    for i, (key, data) in enumerate(time_series.items()):
-        if i < len(colors):
-            fig.add_trace(
-                go.Scatter(
-                    x=data['times'],
-                    y=data['E'],
-                    mode='markers+lines',
-                    name=f"E({key})",
-                    marker=dict(color=colors[i])
-                )
-            )
-    
-    # Add fitted oscillation
-    if oscillation and oscillation.get("best_frequency_hz") is not None:
-        first_key = list(time_series.keys())[0]
-        if first_key in time_series:
-            t = np.linspace(time_series[first_key]['times'][0],
-                           time_series[first_key]['times'][-1], 1000)
-            A = oscillation.get("best_amplitude", 0)
-            omega = oscillation["best_frequency_hz"] * 2 * np.pi
-            phi = oscillation.get("best_phase", 0)
-            mean_E = np.mean([np.mean(data['E']) for data in time_series.values()])
-            y = mean_E + A * np.cos(omega * t + phi)
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=t, y=y,
-                    mode='lines',
-                    name='Fitted Oscillation',
-                    line=dict(color='red', dash='dash')
-                )
-            )
-    
-    fig.update_layout(
-        title="Dark Matter Oscillation Analysis",
-        xaxis_title="Time (s)",
-        yaxis_title="E(a,b)",
-        height=400,
-        showlegend=True
-    )
-    return fig
-
-
-def create_sidereal_plot(sidereal_data):
-    """Create sidereal time plot."""
-    if not sidereal_data or "data" not in sidereal_data:
+def create_vbi_scatter_plot(results):
+    """Create scatter plot of E vs phase settings for VBI data."""
+    if not results or "all_results" not in results:
         return None
     
-    df = sidereal_data["data"]
+    df = results["all_results"]
     fig = go.Figure()
     
+    # Color by beta value
     fig.add_trace(go.Scatter(
-        x=df['sidereal_hour'],
+        x=df['alpha'],
         y=df['E'],
-        mode='markers+lines',
-        name='E(a,b)',
-        error_y=dict(type='data', array=df['sigma_E'])
+        mode='markers',
+        marker=dict(
+            size=10,
+            color=df['beta'],
+            colorscale='Viridis',
+            showscale=True,
+            colorbar=dict(title="Beta")
+        ),
+        text=[f"alpha={a:.1f}°, beta={b:.1f}°<br>E={e:.4f}" 
+              for a, b, e in zip(df['alpha'], df['beta'], df['E'])],
+        hoverinfo='text'
     ))
     
-    # Add fit if available
-    if sidereal_data.get("detected"):
-        hours = np.linspace(0, 24, 100)
-        E0 = sidereal_data.get("E0", 0)
-        A = sidereal_data.get("amplitude", 0)
-        phi = sidereal_data.get("phase", 0)
-        y_fit = E0 + A * np.cos(2*np.pi*hours/24 + phi)
-        
-        fig.add_trace(go.Scatter(
-            x=hours, y=y_fit,
-            mode='lines',
-            name='Sinusoidal Fit',
-            line=dict(color='red', dash='dash')
-        ))
+    # Highlight selected settings
+    if "selected_settings" in results:
+        selected = results["selected_settings"]
+        for s in selected:
+            fig.add_trace(go.Scatter(
+                x=[s['alpha']],
+                y=[s['E']],
+                mode='markers',
+                marker=dict(size=15, color='red', symbol='star'),
+                name=f"α={s['alpha']:.1f}°, β={s['beta']:.1f}°",
+                showlegend=True
+            ))
     
     fig.update_layout(
-        title="Sidereal Time Modulation",
-        xaxis_title="Sidereal Hour",
+        title="Correlation E vs Phase Settings",
+        xaxis_title="Alpha (deg)",
         yaxis_title="E(a,b)",
-        height=400,
-        showlegend=True
+        height=500,
+        hovermode='closest'
     )
-    return fig
-
-
-def create_coincidence_heatmap(results):
-    """Create coincidence count heatmap."""
-    if not results or "per_run" not in results:
-        return None
-    
-    data = []
-    for key in ["ab", "abp", "apb", "apbp"]:
-        if key not in results["per_run"]:
-            continue
-        r = results["per_run"][key]
-        data.append({
-            'Setting': key.upper(),
-            'N++': r['raw_counts']['N++'],
-            'N--': r['raw_counts']['N--'],
-            'N+-': r['raw_counts']['N+-'],
-            'N-+': r['raw_counts']['N-+']
-        })
-    
-    if not data:
-        return None
-    
-    df = pd.DataFrame(data)
-    df_matrix = df.set_index('Setting')[['N++', 'N--', 'N+-', 'N-+']]
-    
-    fig = px.imshow(
-        df_matrix.values,
-        labels=dict(x="Outcome", y="Setting", color="Counts"),
-        x=['N++', 'N--', 'N+-', 'N-+'],
-        y=df['Setting'],
-        title="Coincidence Counts Heatmap",
-        color_continuous_scale="Viridis"
-    )
-    fig.update_layout(height=400)
     return fig
 
 
@@ -857,7 +676,6 @@ def create_confidence_plot(results):
 # STREAMLIT APPLICATION
 # ============================================================================
 
-# Page configuration
 st.set_page_config(
     page_title="🔬 CHSH Bell-Test & Dark Matter Search",
     page_icon="🔬",
@@ -923,12 +741,10 @@ if 'channel_map' not in st.session_state:
     st.session_state.channel_map = None
 if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = None
-if 'dm_results' not in st.session_state:
-    st.session_state.dm_results = None
-if 'sidereal_results' not in st.session_state:
-    st.session_state.sidereal_results = None
-if 'data_source' not in st.session_state:
-    st.session_state.data_source = None
+if 'vbi_results' not in st.session_state:
+    st.session_state.vbi_results = None
+if 'data_type' not in st.session_state:
+    st.session_state.data_type = None
 
 
 def load_sample_data():
@@ -938,32 +754,8 @@ def load_sample_data():
         st.session_state.events_df = events_df
         st.session_state.settings_df = settings_df
         st.session_state.channel_map = channel_map
-        st.session_state.data_source = "sample"
+        st.session_state.data_type = "timestamp"
     st.success("✅ Sample data loaded successfully!")
-
-
-def handle_file_upload(events_file, settings_file, channel_map_str):
-    """Handle file upload and data loading."""
-    if events_file and settings_file and channel_map_str:
-        events_df = load_events(events_file)
-        if events_df is None:
-            return False
-        
-        settings_df = load_settings(settings_file)
-        if settings_df is None:
-            return False
-        
-        channel_map = parse_channel_map(channel_map_str)
-        if channel_map is None:
-            return False
-        
-        st.session_state.events_df = events_df
-        st.session_state.settings_df = settings_df
-        st.session_state.channel_map = channel_map
-        st.session_state.data_source = "upload"
-        st.success("✅ Data loaded successfully!")
-        return True
-    return False
 
 
 # ============================================================================
@@ -978,13 +770,33 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📁 Data Loading")
     
-    data_source = st.radio(
-        "Select data source:",
-        ["Upload Files", "Use Sample Data"],
-        index=1
+    data_type = st.radio(
+        "Data format:",
+        ["VBI Coincidence (.dat)", "Timestamp CSV", "Use Sample Data"]
     )
     
-    if data_source == "Upload Files":
+    if data_type == "VBI Coincidence (.dat)":
+        vbi_file = st.file_uploader("Upload VBI_Coincidence.dat", type=['dat', 'txt', 'csv'])
+        
+        if vbi_file and st.button("Load VBI Data", type="primary"):
+            with st.spinner("Parsing VBI data..."):
+                df = parse_vbi_data(vbi_file)
+                if df is not None:
+                    st.session_state.vbi_data = df
+                    st.session_state.data_type = "vbi"
+                    st.success(f"✅ Loaded {len(df)} data points from VBI file!")
+        
+        if st.session_state.get('vbi_data') is not None:
+            if st.button("Run CHSH from VBI Data", type="primary"):
+                with st.spinner("Computing CHSH S-parameter..."):
+                    results = compute_CHSH_from_vbi(st.session_state.vbi_data)
+                    if "error" in results:
+                        st.error(f"Error: {results['error']}")
+                    else:
+                        st.session_state.vbi_results = results
+                        st.success(f"✅ CHSH S = {results['S']:.4f} ± {results['sigma_S']:.4f}")
+    
+    elif data_type == "Timestamp CSV":
         events_file = st.file_uploader("Upload Events CSV", type=['csv'])
         settings_file = st.file_uploader("Upload Settings CSV", type=['csv'])
         channel_map_str = st.text_input(
@@ -993,35 +805,36 @@ with st.sidebar:
             help="Format: channel:label,channel:label,..."
         )
         
-        if st.button("Load Data", type="primary"):
-            handle_file_upload(events_file, settings_file, channel_map_str)
-    
-    else:  # Sample Data
-        if st.button("Load Sample Data", type="primary"):
-            load_sample_data()
-    
-    # Analysis Parameters
-    if st.session_state.events_df is not None:
-        st.markdown("---")
-        st.markdown("### ⚙️ Analysis Parameters")
+        if st.button("Load Timestamp Data", type="primary"):
+            if events_file and settings_file:
+                events_df = load_events(events_file)
+                settings_df = load_settings(settings_file)
+                channel_map = parse_channel_map(channel_map_str)
+                
+                if events_df is not None and settings_df is not None and channel_map is not None:
+                    st.session_state.events_df = events_df
+                    st.session_state.settings_df = settings_df
+                    st.session_state.channel_map = channel_map
+                    st.session_state.data_type = "timestamp"
+                    st.success("✅ Data loaded successfully!")
         
-        window_ns = st.slider(
-            "Coincidence Window (ns):",
-            min_value=0.5,
-            max_value=10.0,
-            value=2.0,
-            step=0.5,
-            help="Timing window for coincidence detection"
-        )
-        
-        subtract_accidentals = st.checkbox(
-            "Subtract Accidentals",
-            value=True,
-            help="Subtract accidental coincidence background"
-        )
-        
-        col1, col2 = st.columns(2)
-        with col1:
+        if st.session_state.data_type == "timestamp":
+            st.markdown("---")
+            st.markdown("### ⚙️ Analysis Parameters")
+            
+            window_ns = st.slider(
+                "Coincidence Window (ns):",
+                min_value=0.5,
+                max_value=10.0,
+                value=2.0,
+                step=0.5
+            )
+            
+            subtract_accidentals = st.checkbox(
+                "Subtract Accidentals",
+                value=True
+            )
+            
             if st.button("Run CHSH Analysis", type="primary"):
                 with st.spinner("Running CHSH analysis..."):
                     try:
@@ -1034,54 +847,50 @@ with st.sidebar:
                         )
                         st.session_state.analysis_results = results
                         if "error" in results:
-                            st.error(f"Analysis error: {results['error']}")
+                            st.error(f"Error: {results['error']}")
                         else:
-                            st.success("✅ Analysis complete!")
+                            st.success(f"✅ S = {results['chsh']['S']:.4f} ± {results['chsh']['sigma_S']:.4f}")
                     except Exception as e:
                         st.error(f"Analysis failed: {str(e)}")
+    
+    else:  # Sample Data
+        if st.button("Load Sample Data", type="primary"):
+            load_sample_data()
         
-        with col2:
-            if st.button("Run DM Search", type="primary"):
-                with st.spinner("Searching for dark matter..."):
+        if st.session_state.data_type == "timestamp":
+            st.markdown("---")
+            st.markdown("### ⚙️ Analysis Parameters")
+            
+            window_ns = st.slider(
+                "Coincidence Window (ns):",
+                min_value=0.5,
+                max_value=10.0,
+                value=2.0,
+                step=0.5
+            )
+            
+            subtract_accidentals = st.checkbox(
+                "Subtract Accidentals",
+                value=True
+            )
+            
+            if st.button("Run CHSH Analysis", type="primary"):
+                with st.spinner("Running CHSH analysis..."):
                     try:
-                        dm_results = analyze_dark_matter(
+                        results = analyze_run(
                             st.session_state.events_df,
                             st.session_state.settings_df,
                             st.session_state.channel_map,
-                            window_ns
+                            window_ns,
+                            subtract_accidentals
                         )
-                        st.session_state.dm_results = dm_results
-                        if "error" in dm_results:
-                            st.warning(f"DM search issue: {dm_results['error']}")
+                        st.session_state.analysis_results = results
+                        if "error" in results:
+                            st.error(f"Error: {results['error']}")
                         else:
-                            st.success("✅ DM search complete!")
+                            st.success(f"✅ S = {results['chsh']['S']:.4f} ± {results['chsh']['sigma_S']:.4f}")
                     except Exception as e:
-                        st.error(f"DM search failed: {str(e)}")
-        
-        if st.button("Run Sidereal Analysis", type="primary"):
-            with st.spinner("Analyzing sidereal modulation..."):
-                try:
-                    sidereal_results = analyze_sidereal(
-                        st.session_state.events_df,
-                        st.session_state.channel_map,
-                        window_ns
-                    )
-                    st.session_state.sidereal_results = sidereal_results
-                    if "error" not in sidereal_results:
-                        st.success("✅ Sidereal analysis complete!")
-                    else:
-                        st.warning(f"Sidereal issue: {sidereal_results['error']}")
-                except Exception as e:
-                    st.error(f"Sidereal analysis failed: {str(e)}")
-    
-    # Data Info
-    if st.session_state.events_df is not None:
-        st.markdown("---")
-        st.markdown("### 📊 Data Info")
-        st.metric("Events", f"{len(st.session_state.events_df):,}")
-        if st.session_state.settings_df is not None:
-            st.metric("Settings Runs", len(st.session_state.settings_df))
-
+                        st.error(f"Analysis failed: {str(e)}")
 
 # ============================================================================
 # MAIN CONTENT
@@ -1091,91 +900,112 @@ with st.sidebar:
 st.markdown('<p class="main-header">🔬 CHSH Bell-Test & Dark Matter Search</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Quantum Entanglement Analysis with Dark Matter Interference Detection</p>', unsafe_allow_html=True)
 
-# Status indicators
-if st.session_state.events_df is not None:
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(
-            "📊 Events",
-            f"{len(st.session_state.events_df):,}",
-            help="Total detection events"
-        )
-    with col2:
-        if st.session_state.analysis_results and "chsh" in st.session_state.analysis_results and st.session_state.analysis_results["chsh"] is not None:
-            S = st.session_state.analysis_results["chsh"]["S"]
-            sigma = st.session_state.analysis_results["chsh"]["sigma_above_classical"]
-            st.metric(
-                "🎯 S-Parameter",
-                f"{S:.4f}",
-                delta=f"{S-2:.4f}",
-                delta_color="normal"
-            )
-    with col3:
-        if st.session_state.analysis_results and "chsh" in st.session_state.analysis_results and st.session_state.analysis_results["chsh"] is not None:
-            sigma = st.session_state.analysis_results["chsh"]["sigma_above_classical"]
-            st.metric(
-                "📈 Significance",
-                f"{sigma:.2f} σ",
-                help="Sigma above classical bound"
-            )
-
-# Results Tabs
-if st.session_state.analysis_results and "chsh" in st.session_state.analysis_results and st.session_state.analysis_results["chsh"] is not None:
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 CHSH Results",
-        "🔬 Dark Matter Search",
-        "🌙 Sidereal Analysis",
-        "📈 Visualizations",
-        "📋 Report"
-    ])
+# Display results based on data type
+if st.session_state.data_type == "vbi" and st.session_state.get('vbi_results'):
+    results = st.session_state.vbi_results
     
-    with tab1:
-        st.markdown("## 📊 CHSH Bell-Test Results")
-        
-        results = st.session_state.analysis_results
-        chsh = results["chsh"]
-        
-        # Summary cards
+    if "error" in results:
+        st.error(f"Error: {results['error']}")
+    else:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            sigma = chsh["sigma_above_classical"]
+            sigma = results["sigma_above_classical"]
             color = "strong" if sigma > 5 else "moderate" if sigma > 3 else "weak"
-            status = "✅ Strong" if sigma > 5 else "⚠️ Moderate" if sigma > 3 else "❌ Weak"
-            
             st.markdown(f"""
             <div class="metric-card">
                 <h3>S-Parameter</h3>
-                <h2>{chsh["S"]:.4f}</h2>
-                <p>± {chsh["sigma_S"]:.4f}</p>
+                <h2 class="violation-{color}">{results["S"]:.4f}</h2>
+                <p>± {results["sigma_S"]:.4f}</p>
                 <p>Classical bound: 2.0</p>
-                <p class="violation-{color}">{status} violation</p>
             </div>
             """, unsafe_allow_html=True)
         
         with col2:
             st.markdown(f"""
             <div class="metric-card">
-                <h3>Statistical Significance</h3>
-                <h2 class="violation-{color}">{chsh["sigma_above_classical"]:.2f} σ</h2>
-                <p>Above classical bound</p>
-                <p>{'✅' if chsh["within_tsirelson_bound"] else '⚠️'} Within Tsirelson bound</p>
+                <h3>Significance</h3>
+                <h2 class="violation-{color}">{results["sigma_above_classical"]:.2f} σ</h2>
+                <p>{'✅' if results["violates_classical_bound"] else '❌'} {'Violates' if results["violates_classical_bound"] else 'Does not violate'} classical bound</p>
             </div>
             """, unsafe_allow_html=True)
         
         with col3:
             st.markdown(f"""
             <div class="metric-card">
-                <h3>CHSH Interpretation</h3>
-                <p><b>|S| ≤ 2</b>: Classical (Local Realism)</p>
-                <p><b>|S| ≤ {2*np.sqrt(2):.3f}</b>: Quantum</p>
-                <p><b>Current: |S| = {abs(chsh["S"]):.4f}</b></p>
+                <h3>Tsirelson Bound</h3>
+                <p>|S| ≤ {2*np.sqrt(2):.3f}</p>
+                <p>{'✅' if results["within_tsirelson_bound"] else '⚠️'} {'Within' if results["within_tsirelson_bound"] else 'Exceeds'} quantum bound</p>
             </div>
             """, unsafe_allow_html=True)
         
-        # Detailed results
-        st.markdown("### 📋 Per-Setting Results")
+        # Show selected settings
+        st.markdown("### 📋 Selected Phase Settings")
+        selected_data = []
+        for i, s in enumerate(results["selected_settings"]):
+            selected_data.append({
+                "Setting": ["E(a,b)", "E(a,b')", "E(a',b)", "E(a',b')"][i],
+                "Alpha (deg)": f"{s['alpha']:.1f}",
+                "Beta (deg)": f"{s['beta']:.1f}",
+                "E": f"{s['E']:+.4f}",
+                "σ_E": f"{s['sigma_E']:.4f}"
+            })
+        st.dataframe(pd.DataFrame(selected_data), use_container_width=True)
         
+        # Plots
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = create_chsh_plot(results)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            fig = create_vbi_scatter_plot(results)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+
+elif st.session_state.data_type == "timestamp" and st.session_state.analysis_results:
+    results = st.session_state.analysis_results
+    
+    if "error" in results:
+        st.error(f"Error: {results['error']}")
+    else:
+        chsh = results["chsh"]
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            sigma = chsh["sigma_above_classical"]
+            color = "strong" if sigma > 5 else "moderate" if sigma > 3 else "weak"
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>S-Parameter</h3>
+                <h2 class="violation-{color}">{chsh["S"]:.4f}</h2>
+                <p>± {chsh["sigma_S"]:.4f}</p>
+                <p>Classical bound: 2.0</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Significance</h3>
+                <h2 class="violation-{color}">{chsh["sigma_above_classical"]:.2f} σ</h2>
+                <p>{'✅' if chsh["violates_classical_bound"] else '❌'} {'Violates' if chsh["violates_classical_bound"] else 'Does not violate'} classical bound</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Tsirelson Bound</h3>
+                <p>|S| ≤ {2*np.sqrt(2):.3f}</p>
+                <p>{'✅' if chsh["within_tsirelson_bound"] else '⚠️'} {'Within' if chsh["within_tsirelson_bound"] else 'Exceeds'} quantum bound</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Per-setting results
+        st.markdown("### 📋 Per-Setting Results")
         data = []
         for key in ["ab", "abp", "apb", "apbp"]:
             if key not in results["per_run"]:
@@ -1187,12 +1017,9 @@ if st.session_state.analysis_results and "chsh" in st.session_state.analysis_res
                 "B (deg)": r["angle_b_deg"],
                 "E(a,b)": f"{r['E']:+.4f}",
                 "σ_E": f"{r['sigma_E']:.4f}",
-                "Duration (s)": f"{r['duration_s']:.1f}",
                 "Coincidences": r["raw_counts"]["total"]
             })
-        
-        if data:
-            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        st.dataframe(pd.DataFrame(data), use_container_width=True)
         
         # Plots
         col1, col2 = st.columns(2)
@@ -1205,317 +1032,33 @@ if st.session_state.analysis_results and "chsh" in st.session_state.analysis_res
             fig = create_correlation_plot(results)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
-    
-    with tab2:
-        st.markdown("## 🔬 Dark Matter Interference Search")
-        
-        if st.session_state.dm_results:
-            dm = st.session_state.dm_results
-            
-            if "error" in dm:
-                st.warning(f"Dark matter search issue: {dm['error']}")
-            elif "no_oscillation" in dm:
-                st.info("No significant oscillation detected in the data")
-                
-                # Show base CHSH results
-                if "base_result" in dm and "chsh" in dm["base_result"] and dm["base_result"]["chsh"] is not None:
-                    base = dm["base_result"]
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("S-Parameter", f"{base['chsh']['S']:.4f}")
-                    with col2:
-                        st.metric("Significance", f"{base['chsh']['sigma_above_classical']:.2f} σ")
-            else:
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown("""
-                    <div class="metric-card">
-                        <h3>Oscillation Detection</h3>
-                    """, unsafe_allow_html=True)
-                    
-                    osc = dm.get("oscillation", {})
-                    if osc.get("detected"):
-                        st.success("✅ Modulation detected!")
-                        st.metric("Frequency", f"{osc.get('best_frequency_hz', 0):.6f} Hz")
-                        st.metric("Significance", f"{osc.get('significance_sigma', 0):.2f} σ")
-                    else:
-                        st.warning("❌ No significant modulation")
-                
-                with col2:
-                    st.markdown("""
-                    <div class="metric-card">
-                        <h3>Dark Matter Parameters</h3>
-                    """, unsafe_allow_html=True)
-                    
-                    if dm.get("omega_beat"):
-                        st.metric("ω_beat", f"{dm['omega_beat']:.4e} rad/s")
-                        st.metric("Coupling Strength", f"{dm.get('coupling_strength', 0):.4f}")
-                        
-                        # Estimate mass
-                        if dm.get("coupling_strength", 0) > 0:
-                            mass_est = dm["omega_beat"] * HBAR / (dm["coupling_strength"] * C**2)
-                            st.metric("Mass Estimate", f"{mass_est:.2e} eV")
-                
-                with col3:
-                    st.markdown("""
-                    <div class="metric-card">
-                        <h3>Physics Interpretation</h3>
-                    """, unsafe_allow_html=True)
-                    
-                    sig = dm.get("detection_significance", 0)
-                    if sig > 5:
-                        st.success("🔬 Strong dark matter signal!")
-                    elif sig > 3:
-                        st.warning("⚠️ Moderate dark matter evidence")
-                    else:
-                        st.info("No dark matter signal")
-                
-                # Oscillation plot
-                if "time_series" in dm and "oscillation" in dm:
-                    fig = create_dm_oscillation_plot(dm["time_series"], dm["oscillation"])
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-        
-        else:
-            st.info("Run the dark matter search from the sidebar")
-    
-    with tab3:
-        st.markdown("## 🌙 Sidereal Time Analysis")
-        
-        if st.session_state.sidereal_results:
-            sidereal = st.session_state.sidereal_results
-            
-            if "error" in sidereal:
-                st.warning(f"Sidereal analysis issue: {sidereal['error']}")
-            elif "data" in sidereal:
-                df = sidereal["data"]
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown("""
-                    <div class="metric-card">
-                        <h3>Modulation Detection</h3>
-                    """, unsafe_allow_html=True)
-                    
-                    if sidereal.get("detected"):
-                        st.success("✅ Sidereal modulation detected!")
-                        st.metric("Amplitude", f"{sidereal.get('amplitude', 0):.4f}")
-                        st.metric("Significance", f"{sidereal.get('significance', 0):.2f} σ")
-                    else:
-                        st.warning("❌ No sidereal modulation detected")
-                
-                with col2:
-                    st.markdown("""
-                    <div class="metric-card">
-                        <h3>Fit Parameters</h3>
-                    """, unsafe_allow_html=True)
-                    
-                    if sidereal.get("detected"):
-                        st.metric("E₀", f"{sidereal.get('E0', 0):.4f}")
-                        st.metric("Phase", f"{sidereal.get('phase', 0):.2f} rad")
-                
-                with col3:
-                    st.markdown("""
-                    <div class="metric-card">
-                        <h3>Data Overview</h3>
-                    """, unsafe_allow_html=True)
-                    
-                    st.metric("Sidereal Bins", len(df))
-                    st.metric("Mean E", f"{df['E'].mean():+.4f}")
-                
-                # Sidereal plot
-                fig = create_sidereal_plot(sidereal)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # Data table
-                st.markdown("### 📊 Sidereal Data")
-                st.dataframe(df, use_container_width=True)
-        else:
-            st.info("Run the sidereal analysis from the sidebar")
-    
-    with tab4:
-        st.markdown("## 📈 Advanced Visualizations")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = create_coincidence_heatmap(st.session_state.analysis_results)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = create_confidence_plot(st.session_state.analysis_results)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-        
-        # 3D visualization
-        st.markdown("### 🎨 3D Parameter Space")
-        results = st.session_state.analysis_results
-        
-        angles_a = []
-        angles_b = []
-        E_values = []
-        labels = []
-        
-        for key in ["ab", "abp", "apb", "apbp"]:
-            if key not in results["per_run"]:
-                continue
-            r = results["per_run"][key]
-            angles_a.append(r["angle_a_deg"])
-            angles_b.append(r["angle_b_deg"])
-            E_values.append(r["E"])
-            labels.append(key.upper())
-        
-        if angles_a:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter3d(
-                x=angles_a,
-                y=angles_b,
-                z=E_values,
-                mode='markers+text',
-                marker=dict(size=15, color=E_values, colorscale='Viridis'),
-                text=labels,
-                textposition="top center"
-            ))
-            
-            fig.update_layout(
-                scene=dict(
-                    xaxis_title="Angle A (deg)",
-                    yaxis_title="Angle B (deg)",
-                    zaxis_title="E(a,b)"
-                ),
-                height=500
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with tab5:
-        st.markdown("## 📋 Full Analysis Report")
-        
-        results = st.session_state.analysis_results
-        chsh = results["chsh"]
-        
-        # Generate report
-        report = f"""# CHSH Bell-Test Analysis Report
-
-## Summary
-
-- **S-Parameter**: {chsh["S"]:.4f} ± {chsh["sigma_S"]:.4f}
-- **Classical Bound Violation**: {chsh["sigma_above_classical"]:.2f} σ
-- **Within Tsirelson Bound**: {'Yes' if chsh["within_tsirelson_bound"] else 'No'}
-- **Conclusion**: {'Quantum entanglement detected' if chsh["sigma_above_classical"] > 5 else 'Insufficient evidence for entanglement'}
-
-## Per-Setting Results
-
-| Setting | A (deg) | B (deg) | E(a,b) | σ_E | Duration (s) | Coincidences |
-|---------|---------|---------|--------|-----|--------------|--------------|
-"""
-        
-        for key in ["ab", "abp", "apb", "apbp"]:
-            if key not in results["per_run"]:
-                continue
-            r = results["per_run"][key]
-            report += f"| {key.upper()} | {r['angle_a_deg']} | {r['angle_b_deg']} | {r['E']:+.4f} | {r['sigma_E']:.4f} | {r['duration_s']:.1f} | {r['raw_counts']['total']} |\n"
-        
-        # Add dark matter results
-        if st.session_state.dm_results and "error" not in st.session_state.dm_results:
-            dm = st.session_state.dm_results
-            if "oscillation" in dm and dm["oscillation"].get("detected"):
-                osc = dm["oscillation"]
-                report += f"""
-                
-## Dark Matter Search Results
-
-- **Oscillation Detected**: Yes
-- **Frequency**: {osc.get('best_frequency_hz', 0):.6f} Hz
-- **Amplitude**: {osc.get('best_amplitude', 0):.4f}
-- **Significance**: {osc.get('significance_sigma', 0):.2f} σ
-- **Coupling Strength**: {dm.get('coupling_strength', 'N/A')}
-"""
-        
-        # Add sidereal results
-        if st.session_state.sidereal_results and "data" in st.session_state.sidereal_results:
-            sidereal = st.session_state.sidereal_results
-            if sidereal.get("detected"):
-                report += f"""
-                
-## Sidereal Time Analysis
-
-- **Sidereal Modulation**: Detected
-- **Amplitude**: {sidereal.get('amplitude', 0):.4f} ± {sidereal.get('amplitude_error', 0):.4f}
-- **Significance**: {sidereal.get('significance', 0):.2f} σ
-- **Phase**: {sidereal.get('phase', 0):.2f} rad
-"""
-        
-        # Physics interpretation
-        report += f"""
-        
-## Physics Interpretation
-
-The CHSH S-parameter of {chsh["S"]:.4f} {'violates' if chsh["violates_classical_bound"] else 'does not violate'} the classical bound of 2.
-
-- **Local Realism**: {'Excluded' if chsh["violates_classical_bound"] else 'Not excluded'} ({chsh["sigma_above_classical"]:.2f} σ)
-- **Quantum Mechanics**: {'Consistent' if chsh["within_tsirelson_bound"] else 'Inconsistent'} (within Tsirelson bound)
-"""
-        
-        st.markdown(report)
-        
-        # Download button
-        st.download_button(
-            label="📥 Download Full Report",
-            data=report,
-            file_name="chsh_analysis_report.md",
-            mime="text/markdown"
-        )
 
 else:
     # Welcome screen
     st.markdown("""
     ### 🚀 Getting Started
     
-    1. **Load your data** using the sidebar
-    2. **Configure the channel mapping** for your detectors
-    3. **Set analysis parameters** (coincidence window, etc.)
-    4. **Run the analysis** to compute CHSH S-parameter
-    5. **Explore the results** in the tabs above
+    Choose your data format from the sidebar:
     
-    ### 📁 Data Format Requirements
+    #### 1. VBI Coincidence (.dat)
+    - Upload the `VBI_Coincidence_20230707.dat` file
+    - The system will automatically parse the phase settings and compute CHSH
     
-    **Events CSV:**
-    - Columns: `timestamp_ns`, `channel`
-    - `timestamp_ns`: detection time in nanoseconds
-    - `channel`: detector channel ID (integer)
+    #### 2. Timestamp CSV
+    - Upload `events.csv` and `settings.csv`
+    - Configure channel mapping
+    - Run CHSH analysis
     
-    **Settings CSV:**
-    - Columns: `run_id`, `start_ns`, `end_ns`, `angle_a_deg`, `angle_b_deg`
-    - `run_id`: one of `ab`, `abp`, `apb`, `apbp`
-    - `start_ns`/`end_ns`: time range for each run
-    - `angle_a_deg`/`angle_b_deg`: analyzer angles in degrees
+    #### 3. Sample Data
+    - Click "Load Sample Data" to test the pipeline
+    - Synthetic entangled photon data will be generated
     
-    ### 🔬 Features
+    ### 📁 VBI Data Format
     
-    - **CHSH Bell Test**: Compute S-parameter and violation significance
-    - **Dark Matter Search**: Detect oscillatory modulations in coincidence counts
-    - **Sidereal Analysis**: Search for daily modulation patterns
-    - **Interactive Visualizations**: Plotly-based dynamic plots
-    - **Comprehensive Reporting**: Generate full analysis reports
+    The VBI dataset contains pre-computed coincidence counts for various phase settings:
+    - Columns 0-1: Phase settings (alpha, beta)
+    - Column 9: Coincidence count N_AB (A+,B+)
+    - Column 10: Coincidence count N_CD (A-,B-)
+    
+    The system will automatically find the optimal CHSH settings!
     """)
-    
-    # Quick example
-    if st.button("🚀 Load Example & Run Analysis"):
-        load_sample_data()
-        with st.spinner("Running analysis..."):
-            try:
-                results = analyze_run(
-                    st.session_state.events_df,
-                    st.session_state.settings_df,
-                    st.session_state.channel_map,
-                    2.0,
-                    True
-                )
-                st.session_state.analysis_results = results
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
