@@ -23,8 +23,6 @@ import json
 import base64
 from io import BytesIO, StringIO
 from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 warnings.filterwarnings('ignore')
 
@@ -193,7 +191,7 @@ def generate_synthetic_chsh_data(seed=42, counts_per_setting=100000, noise=0.01)
     sigma_above = (abs(S) - 2.0) / sigma_S if sigma_S > 0 else 0
     
     return {
-        'name': 'Synthetic CHSH Data',
+        'name': 'Synthetic Quantum Data',
         'citation': 'Generated synthetic data with known CHSH violation',
         'settings': results,
         'S': S,
