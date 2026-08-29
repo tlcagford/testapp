@@ -42,7 +42,7 @@ M_sun = 1.0   # solar mass in solar masses
 def fdm_density(r, rho0, r_s):
     """
     FDM soliton density profile.
-    ρ(r) = ρ₀ [sin(kr)/(kr)]², where k = π/r_s
+    rho(r) = rho0 * [sin(kr)/(kr)]^2, where k = pi/r_s
     """
     if r == 0:
         return rho0
@@ -53,7 +53,7 @@ def fdm_density(r, rho0, r_s):
 def fdm_mass_enclosed(r, rho0, r_s):
     """
     Enclosed mass of FDM soliton within radius r.
-    M(r) = 4π ∫₀ʳ ρ(r') r'² dr'
+    M(r) = 4*pi * ∫_0^r rho(r') r'^2 dr'
     """
     def integrand(rp):
         return 4 * np.pi * rp**2 * fdm_density(rp, rho0, r_s)
@@ -63,11 +63,11 @@ def qcaus_rotation_curve(r, rho0, r_s, M_baryon, epsilon=0.0, Omega=0.0):
     """
     QCAUS two-field model rotation curve.
     
-    V_circ²(r) = G * [M_baryon(r) + M_FDM(r)] / r
+    V_circ^2(r) = G * [M_baryon(r) + M_FDM(r)] / r
     
     Parameters:
     - r: radius in kpc
-    - rho0: central density of FDM soliton (M_sun/kpc³)
+    - rho0: central density of FDM soliton (M_sun/kpc^3)
     - r_s: soliton scale radius (kpc)
     - M_baryon: enclosed baryonic mass at radius r (M_sun)
     - epsilon: kinetic mixing parameter (dimensionless)
@@ -98,8 +98,8 @@ def qcaus_rotation_curve(r, rho0, r_s, M_baryon, epsilon=0.0, Omega=0.0):
 def baryonic_mass_from_components(r, Vgas, Vdisk, Vbul):
     """
     Estimate enclosed baryonic mass from rotation curve components.
-    M_baryon(r) = r * V_baryon² / G
-    where V_baryon² = Vgas² + Vdisk² + Vbul²
+    M_baryon(r) = r * V_baryon^2 / G
+    where V_baryon^2 = Vgas^2 + Vdisk^2 + Vbul^2
     """
     V_baryon = np.sqrt(Vgas**2 + Vdisk**2 + Vbul**2)
     return r * V_baryon**2 / G
@@ -158,23 +158,23 @@ def main():
     st.sidebar.header("QCAUS Parameters")
     
     log_rho0 = st.sidebar.slider(
-        "log₁₀(ρ₀) [M☉/kpc³]",
+        "log10(rho0) [M_sun/kpc^3]",
         min_value=2.0, max_value=8.0, value=5.0, step=0.1
     )
     rho0 = 10**log_rho0
     
     r_s = st.sidebar.slider(
-        "rₛ [kpc]",
+        "r_s [kpc]",
         min_value=0.1, max_value=10.0, value=1.0, step=0.1
     )
     
     epsilon = st.sidebar.slider(
-        "ε (kinetic mixing)",
+        "epsilon (kinetic mixing)",
         min_value=0.0, max_value=1.0, value=0.01, step=0.01
     )
     
     Omega = st.sidebar.slider(
-        "Ω (interference coherence)",
+        "Omega (interference coherence)",
         min_value=0.0, max_value=1.0, value=0.5, step=0.05
     )
     
@@ -208,7 +208,7 @@ def main():
         
         # QCAUS prediction
         ax.plot(R, V_qcaus, '-', color='red', linewidth=2, 
-               label=f'QCAUS (ρ₀={rho0:.1e}, rₛ={r_s:.2f}, ε={epsilon:.2f})')
+               label=f'QCAUS (rho0={rho0:.1e}, r_s={r_s:.2f}, eps={epsilon:.2f})')
         
         ax.set_xlabel('Radius [kpc]', fontsize=12)
         ax.set_ylabel('Circular Velocity [km/s]', fontsize=12)
@@ -223,10 +223,10 @@ def main():
         
         st.metric("Galaxy", selected_galaxy)
         st.metric("Data Points", len(R))
-        st.metric("ρ₀", f"{rho0:.2e} M☉/kpc³")
-        st.metric("rₛ", f"{r_s:.2f} kpc")
-        st.metric("ε", f"{epsilon:.3f}")
-        st.metric("Ω", f"{Omega:.3f}")
+        st.metric("rho0", f"{rho0:.2e} M_sun/kpc^3")
+        st.metric("r_s", f"{r_s:.2f} kpc")
+        st.metric("epsilon", f"{epsilon:.3f}")
+        st.metric("Omega", f"{Omega:.3f}")
         
         # Compute residuals
         residuals = Vobs_fit - qcaus_rotation_curve(R_fit, rho0, r_s, 
@@ -239,14 +239,14 @@ def main():
         dof = len(R_fit) - 3  # rho0, r_s, epsilon
         if dof > 0:
             reduced_chi2 = chi2 / dof
-            st.metric("χ²/dof", f"{reduced_chi2:.2f}")
+            st.metric("chi^2/dof", f"{reduced_chi2:.2f}")
         
-        st.info(f"""
-        **ℹ️ About this fit**
+        st.info("""
+        **About this fit**
         
         The QCAUS two-field model combines:
-        - **FDM soliton core**: ρ(r) = ρ₀ [sin(kr)/(kr)]²
-        - **PDP interference**: ε · Ω · e^{-Ωr²}
+        - FDM soliton core: rho(r) = rho0 * [sin(kr)/(kr)]^2
+        - PDP interference: eps * Omega * exp(-Omega * r^2)
         
         Adjust the sliders to find the best fit to the data.
         """)
