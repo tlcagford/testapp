@@ -55,6 +55,8 @@ def fdm_mass_enclosed(r, rho0, r_s):
     Enclosed mass of FDM soliton within radius r.
     M(r) = 4*pi * ∫_0^r rho(r') r'^2 dr'
     """
+    if r == 0:
+        return 0.0
     def integrand(rp):
         return 4 * np.pi * rp**2 * fdm_density(rp, rho0, r_s)
     return quad(integrand, 0, r, limit=200)[0]
@@ -72,23 +74,21 @@ def qcaus_rotation_curve(r, rho0, r_s, M_baryon, epsilon=0.0, Omega=0.0):
     - M_baryon: enclosed baryonic mass at radius r (M_sun)
     - epsilon: kinetic mixing parameter (dimensionless)
     - Omega: interference coherence parameter (dimensionless)
-    
-    Note: epsilon and Omega affect the interference term in the density,
-    which manifests as small-scale fluctuations in the rotation curve.
-    For a first-order fit, we primarily use the soliton component.
     """
+    if r <= 0:
+        return 0.0
+    
     # FDM contribution
     M_fdm = fdm_mass_enclosed(r, rho0, r_s)
     
     # Interference correction (small effect from epsilon and Omega)
-    # For simplicity in this demonstration, we include it as a perturbation
     interference_factor = 1.0 + epsilon * Omega * np.exp(-(r / r_s)**2) * 0.1
     
     # Total enclosed mass
     M_total = M_baryon + M_fdm * interference_factor
     
     # Circular velocity
-    V_circ = np.sqrt(G * M_total / r) if r > 0 else 0.0
+    V_circ = np.sqrt(G * M_total / r)
     return V_circ
 
 # ============================================================================
@@ -147,12 +147,14 @@ def main():
     Vdisk = np.array([p.get('Vdisk', 0.0) for p in data_points])
     Vbul = np.array([p.get('Vbul', 0.0) for p in data_points])
     
-    # Filter out points with missing errors
-    valid = ~np.isnan(errV) & (errV > 0)
+    # Filter out points with missing errors and radius <= 0
+    valid = ~np.isnan(errV) & (errV > 0) & (R > 0)
     R_fit = R[valid]
     Vobs_fit = Vobs[valid]
     errV_fit = errV[valid]
     Vgas_fit = Vgas[valid] if len(Vgas) == len(R) else np.zeros_like(R_fit)
+    Vdisk_fit = Vdisk[valid] if len(Vdisk) == len(R) else np.zeros_like(R_fit)
+    Vbul_fit = Vbul[valid] if len(Vbul) == len(R) else np.zeros_like(R_fit)
     
     # QCAUS parameters
     st.sidebar.header("QCAUS Parameters")
@@ -222,24 +224,28 @@ def main():
         st.subheader("Model Parameters")
         
         st.metric("Galaxy", selected_galaxy)
-        st.metric("Data Points", len(R))
+        st.metric("Data Points (total)", len(R))
+        st.metric("Fit Points", len(R_fit))
         st.metric("rho0", f"{rho0:.2e} M_sun/kpc^3")
         st.metric("r_s", f"{r_s:.2f} kpc")
         st.metric("epsilon", f"{epsilon:.3f}")
         st.metric("Omega", f"{Omega:.3f}")
         
-        # Compute residuals
-        residuals = Vobs_fit - qcaus_rotation_curve(R_fit, rho0, r_s, 
-            baryonic_mass_from_components(R_fit, Vgas_fit, np.zeros_like(R_fit), np.zeros_like(R_fit)),
-            epsilon, Omega
-        )
-        
-        # Simple chi-squared
-        chi2 = np.sum((residuals / errV_fit)**2)
-        dof = len(R_fit) - 3  # rho0, r_s, epsilon
-        if dof > 0:
-            reduced_chi2 = chi2 / dof
-            st.metric("chi^2/dof", f"{reduced_chi2:.2f}")
+        # Compute residuals only if we have enough points
+        if len(R_fit) > 0:
+            # Compute baryonic mass for the fit points
+            M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
+            # Predict QCAUS velocity at those radii
+            V_qcaus_fit = np.array([
+                qcaus_rotation_curve(r, rho0, r_s, M_baryon_fit[i], epsilon, Omega)
+                for i, r in enumerate(R_fit)
+            ])
+            residuals = Vobs_fit - V_qcaus_fit
+            chi2 = np.sum((residuals / errV_fit)**2)
+            dof = len(R_fit) - 3  # rho0, r_s, epsilon
+            if dof > 0:
+                reduced_chi2 = chi2 / dof
+                st.metric("chi^2/dof", f"{reduced_chi2:.2f}")
         
         st.info("""
         **About this fit**
