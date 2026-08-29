@@ -1,6 +1,7 @@
 """
 QCAUS Two-Field Model SPARC Rotation Curve Fitter
 Test the QCAUS model against real galaxy rotation curve data.
+Includes an auto-fit button for rho0 and r_s.
 """
 
 import json
@@ -9,7 +10,7 @@ import urllib.request
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
-from scipy.optimize import curve_fit
+from scipy.optimize import minimize
 from scipy.integrate import quad
 
 # ============================================================================
@@ -105,7 +106,29 @@ def baryonic_mass_from_components(r, Vgas, Vdisk, Vbul):
     return r * V_baryon**2 / G
 
 # ============================================================================
-# 4. STREAMLIT APP
+# 4. AUTO-FIT FUNCTION
+# ============================================================================
+
+def fit_qcaus(R, Vobs, errV, M_baryon, epsilon, Omega, initial_guess):
+    """
+    Find the best-fit rho0 and r_s using least-squares minimization.
+    Keeps epsilon and Omega fixed at their current slider values.
+    """
+    def chi2(params):
+        rho0, r_s = params
+        V_model = np.array([
+            qcaus_rotation_curve(r, rho0, r_s, M_baryon[i], epsilon, Omega)
+            for i, r in enumerate(R)
+        ])
+        return np.sum(((Vobs - V_model) / errV)**2)
+    
+    # Bounds: rho0 (1e2 to 1e9), r_s (0.1 to 20.0 kpc)
+    bounds = [(1e2, 1e9), (0.1, 20.0)]
+    result = minimize(chi2, initial_guess, bounds=bounds, method='L-BFGS-B')
+    return result.x
+
+# ============================================================================
+# 5. STREAMLIT APP
 # ============================================================================
 
 def main():
@@ -156,29 +179,66 @@ def main():
     Vdisk_fit = Vdisk[valid] if len(Vdisk) == len(R) else np.zeros_like(R_fit)
     Vbul_fit = Vbul[valid] if len(Vbul) == len(R) else np.zeros_like(R_fit)
     
-    # QCAUS parameters
+    # --- QCAUS Parameters with Session State for auto-fit ---
     st.sidebar.header("QCAUS Parameters")
+    
+    # Initialize session state values if not present
+    if 'log_rho0' not in st.session_state:
+        st.session_state.log_rho0 = 5.0
+    if 'r_s' not in st.session_state:
+        st.session_state.r_s = 1.0
+    if 'epsilon' not in st.session_state:
+        st.session_state.epsilon = 0.01
+    if 'Omega' not in st.session_state:
+        st.session_state.Omega = 0.5
     
     log_rho0 = st.sidebar.slider(
         "log10(rho0) [M_sun/kpc^3]",
-        min_value=2.0, max_value=8.0, value=5.0, step=0.1
+        min_value=2.0, max_value=9.0, step=0.1,
+        key='log_rho0'  # binds to session_state
     )
     rho0 = 10**log_rho0
     
     r_s = st.sidebar.slider(
         "r_s [kpc]",
-        min_value=0.1, max_value=10.0, value=1.0, step=0.1
+        min_value=0.1, max_value=20.0, step=0.1,
+        key='r_s'
     )
     
     epsilon = st.sidebar.slider(
         "epsilon (kinetic mixing)",
-        min_value=0.0, max_value=1.0, value=0.01, step=0.01
+        min_value=0.0, max_value=1.0, step=0.01,
+        key='epsilon'
     )
     
     Omega = st.sidebar.slider(
         "Omega (interference coherence)",
-        min_value=0.0, max_value=1.0, value=0.5, step=0.05
+        min_value=0.0, max_value=1.0, step=0.05,
+        key='Omega'
     )
+    
+    # --- Auto-Fit Button ---
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🚀 Auto-Fit (rho0 & r_s)", use_container_width=True):
+        if len(R_fit) > 3:
+            with st.spinner("Fitting... This may take a few seconds."):
+                # Compute baryonic mass for fit points
+                M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
+                # Initial guess from current sliders
+                initial_guess = [rho0, r_s]
+                try:
+                    best_rho0, best_r_s = fit_qcaus(
+                        R_fit, Vobs_fit, errV_fit, M_baryon_fit,
+                        epsilon, Omega, initial_guess
+                    )
+                    # Update session state (this will trigger a rerun)
+                    st.session_state.log_rho0 = np.log10(best_rho0)
+                    st.session_state.r_s = best_r_s
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Fit failed: {e}")
+        else:
+            st.sidebar.warning("Not enough valid data points to fit.")
     
     # Compute baryonic mass and model prediction
     M_baryon = baryonic_mass_from_components(R, Vgas, Vdisk, Vbul)
@@ -190,7 +250,7 @@ def main():
     ])
     
     # ========================================================================
-    # 5. DISPLAY RESULTS
+    # 6. DISPLAY RESULTS
     # ========================================================================
     
     col1, col2 = st.columns([2, 1])
@@ -231,21 +291,28 @@ def main():
         st.metric("epsilon", f"{epsilon:.3f}")
         st.metric("Omega", f"{Omega:.3f}")
         
-        # Compute residuals only if we have enough points
+        # Compute residuals and chi^2 if we have fit points
         if len(R_fit) > 0:
-            # Compute baryonic mass for the fit points
             M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
-            # Predict QCAUS velocity at those radii
             V_qcaus_fit = np.array([
                 qcaus_rotation_curve(r, rho0, r_s, M_baryon_fit[i], epsilon, Omega)
                 for i, r in enumerate(R_fit)
             ])
             residuals = Vobs_fit - V_qcaus_fit
             chi2 = np.sum((residuals / errV_fit)**2)
-            dof = len(R_fit) - 3  # rho0, r_s, epsilon
+            dof = len(R_fit) - 3  # rho0, r_s, epsilon (Omega is held fixed in this simple fit)
             if dof > 0:
                 reduced_chi2 = chi2 / dof
                 st.metric("chi^2/dof", f"{reduced_chi2:.2f}")
+                # Show a qualitative rating
+                if reduced_chi2 < 2.0:
+                    st.success("Excellent fit!")
+                elif reduced_chi2 < 5.0:
+                    st.info("Good fit.")
+                elif reduced_chi2 < 20.0:
+                    st.warning("Moderate fit. Try adjusting sliders or auto-fit.")
+                else:
+                    st.error("Poor fit. Use auto-fit or manually adjust sliders.")
         
         st.info("""
         **About this fit**
@@ -254,7 +321,8 @@ def main():
         - FDM soliton core: rho(r) = rho0 * [sin(kr)/(kr)]^2
         - PDP interference: eps * Omega * exp(-Omega * r^2)
         
-        Adjust the sliders to find the best fit to the data.
+        **Auto-fit** optimizes rho0 and r_s only.
+        Adjust epsilon and Omega manually to fine-tune.
         """)
 
 if __name__ == "__main__":
