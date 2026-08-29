@@ -179,7 +179,7 @@ def main():
     Vdisk_fit = Vdisk[valid] if len(Vdisk) == len(R) else np.zeros_like(R_fit)
     Vbul_fit = Vbul[valid] if len(Vbul) == len(R) else np.zeros_like(R_fit)
     
-    # --- QCAUS Parameters with Session State for auto-fit ---
+    # --- QCAUS Parameters with Session State (no 'key' on sliders) ---
     st.sidebar.header("QCAUS Parameters")
     
     # Initialize session state values if not present
@@ -192,46 +192,50 @@ def main():
     if 'Omega' not in st.session_state:
         st.session_state.Omega = 0.5
     
+    # Sliders without 'key' – read from session_state, write back after
     log_rho0 = st.sidebar.slider(
         "log10(rho0) [M_sun/kpc^3]",
         min_value=2.0, max_value=9.0, step=0.1,
-        key='log_rho0'  # binds to session_state
+        value=st.session_state.log_rho0
     )
-    rho0 = 10**log_rho0
+    st.session_state.log_rho0 = log_rho0  # safe because slider has no 'key'
     
     r_s = st.sidebar.slider(
         "r_s [kpc]",
         min_value=0.1, max_value=20.0, step=0.1,
-        key='r_s'
+        value=st.session_state.r_s
     )
+    st.session_state.r_s = r_s
     
     epsilon = st.sidebar.slider(
         "epsilon (kinetic mixing)",
         min_value=0.0, max_value=1.0, step=0.01,
-        key='epsilon'
+        value=st.session_state.epsilon
     )
+    st.session_state.epsilon = epsilon
     
     Omega = st.sidebar.slider(
         "Omega (interference coherence)",
         min_value=0.0, max_value=1.0, step=0.05,
-        key='Omega'
+        value=st.session_state.Omega
     )
+    st.session_state.Omega = Omega
     
     # --- Auto-Fit Button ---
     st.sidebar.markdown("---")
     if st.sidebar.button("🚀 Auto-Fit (rho0 & r_s)", use_container_width=True):
         if len(R_fit) > 3:
             with st.spinner("Fitting... This may take a few seconds."):
-                # Compute baryonic mass for fit points
                 M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
-                # Initial guess from current sliders
-                initial_guess = [rho0, r_s]
+                initial_guess = [10**st.session_state.log_rho0, st.session_state.r_s]
                 try:
                     best_rho0, best_r_s = fit_qcaus(
                         R_fit, Vobs_fit, errV_fit, M_baryon_fit,
-                        epsilon, Omega, initial_guess
+                        st.session_state.epsilon,
+                        st.session_state.Omega,
+                        initial_guess
                     )
-                    # Update session state (this will trigger a rerun)
+                    # Update session state (these will be used in the next run)
                     st.session_state.log_rho0 = np.log10(best_rho0)
                     st.session_state.r_s = best_r_s
                     st.rerun()
@@ -239,6 +243,12 @@ def main():
                     st.sidebar.error(f"Fit failed: {e}")
         else:
             st.sidebar.warning("Not enough valid data points to fit.")
+    
+    # Retrieve current parameters from session_state
+    rho0 = 10**st.session_state.log_rho0
+    r_s = st.session_state.r_s
+    epsilon = st.session_state.epsilon
+    Omega = st.session_state.Omega
     
     # Compute baryonic mass and model prediction
     M_baryon = baryonic_mass_from_components(R, Vgas, Vdisk, Vbul)
@@ -300,7 +310,7 @@ def main():
             ])
             residuals = Vobs_fit - V_qcaus_fit
             chi2 = np.sum((residuals / errV_fit)**2)
-            dof = len(R_fit) - 3  # rho0, r_s, epsilon (Omega is held fixed in this simple fit)
+            dof = len(R_fit) - 3  # rho0, r_s, epsilon (Omega is held fixed)
             if dof > 0:
                 reduced_chi2 = chi2 / dof
                 st.metric("chi^2/dof", f"{reduced_chi2:.2f}")
