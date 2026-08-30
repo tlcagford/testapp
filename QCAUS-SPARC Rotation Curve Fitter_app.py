@@ -2,6 +2,7 @@
 QCAUS Two-Field Model SPARC Rotation Curve Fitter
 Test the QCAUS model against real galaxy rotation curve data.
 Includes auto-fit for 2 and 4 parameters.
+Compatible with NumPy 2.0 (uses scipy.integrate.quad).
 """
 
 import json
