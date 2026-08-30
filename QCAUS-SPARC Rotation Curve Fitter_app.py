@@ -1,8 +1,8 @@
 """
 QCAUS Two-Field Model SPARC Rotation Curve Fitter
 Test the QCAUS model against real galaxy rotation curve data.
-Includes auto-fit for 2 and 4 parameters, plot color configurations,
-and custom diagnostic metrics.
+Includes auto-fit for 2 and 4 parameters.
+Compatible with NumPy 2.0 (uses scipy.integrate.quad).
 """
 
 import json
@@ -22,7 +22,7 @@ from scipy.integrate import quad
 def load_corpus():
     """Download and load the unified HI rotation curve corpus from Zenodo."""
     filename = "rotation_curve_corpus_v7.json"
-    url = "https://zenodo.org"
+    url = "https://zenodo.org/records/19563417/files/rotation_curve_corpus_v7.json"
     
     if not os.path.exists(filename):
         with st.spinner(f"Downloading {filename} from Zenodo..."):
@@ -51,7 +51,6 @@ def fdm_mass_enclosed(r, rho0, r_s):
         return 0.0
     def integrand(rp):
         return 4 * np.pi * rp**2 * fdm_density(rp, rho0, r_s)
-    # limit=200 prevents truncation errors inside optimization routines
     return quad(integrand, 0, r, limit=200)[0]
 
 def qcaus_rotation_curve(r, rho0, r_s, M_baryon, epsilon=0.0, Omega=0.0):
@@ -110,7 +109,7 @@ def main():
     st.title("🌌 QCAUS Two-Field Model: SPARC Rotation Curve Fitter")
     st.markdown("""
     Test the QCAUS two-field FDM model against real galaxy rotation curve data 
-    from the SPARC survey. Customize plot cosmetics and optimize weights on the fly.
+    from the SPARC survey.
     """)
     
     # Load data
@@ -119,8 +118,8 @@ def main():
     
     galaxies = [g['galaxy'] for g in corpus['galaxies']]
     
-    # --- Sidebar Controls ---
-    st.sidebar.header("Data Selection")
+    # Sidebar controls
+    st.sidebar.header("Controls")
     
     selected_galaxy = st.sidebar.selectbox(
         "Select Galaxy",
@@ -148,8 +147,7 @@ def main():
     Vbul_fit = Vbul[valid] if len(Vbul) == len(R) else np.zeros_like(R_fit)
     
     # --- QCAUS Parameters with Session State ---
-    st.sidebar.markdown("---")
-    st.sidebar.header("Model Hyperparameters")
+    st.sidebar.header("QCAUS Parameters")
     
     if 'log_rho0' not in st.session_state:
         st.session_state.log_rho0 = 5.0
@@ -188,13 +186,12 @@ def main():
     )
     st.session_state.Omega = Omega
     
-    # --- Auto-Fit Actions ---
+    # --- Auto-Fit Buttons ---
     st.sidebar.markdown("---")
-    st.sidebar.header("Optimization Engines")
     
-    if st.sidebar.button("🚀 Auto-Fit Core (rho0 & r_s)", use_container_width=True):
-        if len(R_fit) > 2:
-            with st.spinner("Executing L-BFGS-B parameter sweep..."):
+    if st.sidebar.button("🚀 Auto-Fit (rho0 & r_s)", use_container_width=True):
+        if len(R_fit) > 3:
+            with st.spinner("Fitting rho0 and r_s..."):
                 M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
                 initial_guess = [10**st.session_state.log_rho0, st.session_state.r_s]
                 try:
@@ -203,17 +200,17 @@ def main():
                         st.session_state.epsilon, st.session_state.Omega,
                         initial_guess
                     )
-                    st.session_state.log_rho0 = float(np.log10(best_rho0))
-                    st.session_state.r_s = float(best_r_s)
+                    st.session_state.log_rho0 = np.log10(best_rho0)
+                    st.session_state.r_s = best_r_s
                     st.rerun()
                 except Exception as e:
-                    st.sidebar.error(f"Fit failure occurred: {e}")
+                    st.sidebar.error(f"Fit failed: {e}")
         else:
-            st.sidebar.warning("Insufficient structural data variance to execute core fit.")
+            st.sidebar.warning("Not enough valid data points to fit.")
     
-    if st.sidebar.button("🚀 Auto-Fit Full (4 Parameters)", use_container_width=True):
-        if len(R_fit) > 4:
-            with st.spinner("Executing multi-dimensional minimization..."):
+    if st.sidebar.button("🚀 Auto-Fit (All 4 Parameters)", use_container_width=True):
+        if len(R_fit) > 5:
+            with st.spinner("Fitting all parameters..."):
                 M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
                 initial_guess = [
                     10**st.session_state.log_rho0,
@@ -225,31 +222,92 @@ def main():
                     best_rho0, best_r_s, best_eps, best_Omega = fit_qcaus_all(
                         R_fit, Vobs_fit, errV_fit, M_baryon_fit, initial_guess
                     )
-                    st.session_state.log_rho0 = float(np.log10(best_rho0))
-                    st.session_state.r_s = float(best_r_s)
-                    st.session_state.epsilon = float(best_eps)
-                    st.session_state.Omega = float(best_Omega)
+                    st.session_state.log_rho0 = np.log10(best_rho0)
+                    st.session_state.r_s = best_r_s
+                    st.session_state.epsilon = best_eps
+                    st.session_state.Omega = best_Omega
                     st.rerun()
                 except Exception as e:
-                    st.sidebar.error(f"Fit failure occurred: {e}")
+                    st.sidebar.error(f"Fit failed: {e}")
         else:
-            st.sidebar.warning("Degrees of freedom exceed total filtering vector metrics.")
-
-    # --- Plot Design Controls ---
-    st.sidebar.markdown("---")
-    st.sidebar.header("Plot Presentation Styles")
-    fit_line_color = st.sidebar.color_picker("Model Prediction Line", "#DC143C")
-    baryon_line_color = st.sidebar.color_picker("Baryonic Profile Base", "#1E90FF")
-    data_points_color = st.sidebar.color_picker("SPARC Observables", "#000000")
-
-    # ============================================================================
-    # 6. DASHBOARD METRICS AND PLOT COMPUTATION
-    # ============================================================================
+            st.sidebar.warning("Not enough valid data points to fit all 4 parameters.")
     
-    # Calculate model predictions based on parameters
-    M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
-    V_model = np.array([
-        qcaus_rotation_curve(r, 10**log_rho0, r_s, M_baryon_fit[i], epsilon, Omega)
-        for i, r in enumerate(R_fit)
+    # Get current parameters
+    rho0 = 10**st.session_state.log_rho0
+    r_s = st.session_state.r_s
+    epsilon = st.session_state.epsilon
+    Omega = st.session_state.Omega
+    
+    # Compute model
+    M_baryon = baryonic_mass_from_components(R, Vgas, Vdisk, Vbul)
+    V_qcaus = np.array([
+        qcaus_rotation_curve(r, rho0, r_s, M_baryon[i], epsilon, Omega)
+        for i, r in enumerate(R)
     ])
     
+    # ========================================================================
+    # 6. DISPLAY RESULTS
+    # ========================================================================
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("Rotation Curve")
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.errorbar(R, Vobs, yerr=errV, fmt='o', color='black',
+                   label=f'{selected_galaxy} (SPARC)', capsize=3, markersize=4)
+        V_baryon = np.sqrt(Vgas**2 + Vdisk**2 + Vbul**2)
+        ax.plot(R, V_baryon, '--', color='orange', label='Baryonic only')
+        ax.plot(R, V_qcaus, '-', color='red', linewidth=2,
+               label=f'QCAUS (rho0={rho0:.1e}, r_s={r_s:.2f}, eps={epsilon:.2f})')
+        ax.set_xlabel('Radius [kpc]', fontsize=12)
+        ax.set_ylabel('Circular Velocity [km/s]', fontsize=12)
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f'{selected_galaxy} — QCAUS Two-Field Model Fit')
+        st.pyplot(fig)
+    
+    with col2:
+        st.subheader("Model Parameters")
+        st.metric("Galaxy", selected_galaxy)
+        st.metric("Data Points (total)", len(R))
+        st.metric("Fit Points", len(R_fit))
+        st.metric("rho0", f"{rho0:.2e} M_sun/kpc^3")
+        st.metric("r_s", f"{r_s:.2f} kpc")
+        st.metric("epsilon", f"{epsilon:.3f}")
+        st.metric("Omega", f"{Omega:.3f}")
+        
+        if len(R_fit) > 0:
+            M_baryon_fit = baryonic_mass_from_components(R_fit, Vgas_fit, Vdisk_fit, Vbul_fit)
+            V_qcaus_fit = np.array([
+                qcaus_rotation_curve(r, rho0, r_s, M_baryon_fit[i], epsilon, Omega)
+                for i, r in enumerate(R_fit)
+            ])
+            residuals = Vobs_fit - V_qcaus_fit
+            chi2 = np.sum((residuals / errV_fit)**2)
+            dof = len(R_fit) - 4  # now fitting 4 parameters
+            if dof > 0:
+                reduced_chi2 = chi2 / dof
+                st.metric("chi^2/dof", f"{reduced_chi2:.2f}")
+                if reduced_chi2 < 2.0:
+                    st.success("Excellent fit!")
+                elif reduced_chi2 < 5.0:
+                    st.info("Good fit.")
+                elif reduced_chi2 < 20.0:
+                    st.warning("Moderate fit. Try auto-fit all 4 parameters.")
+                else:
+                    st.error("Poor fit. Use auto-fit all 4 parameters.")
+        
+        st.info("""
+        **About this fit**
+        
+        The QCAUS two-field model combines:
+        - FDM soliton core: rho(r) = rho0 * [sin(kr)/(kr)]^2
+        - PDP interference: eps * Omega * exp(-Omega * r^2)
+        
+        **Auto-fit (2 param)** optimizes rho0 and r_s.
+        **Auto-fit (4 param)** optimizes all four.
+        """)
+
+if __name__ == "__main__":
+    main()
